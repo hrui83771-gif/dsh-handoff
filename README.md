@@ -1,5 +1,7 @@
 # dsh-handoff
 
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/hrui83771-gif/dsh-handoff)
+
 DeepSeek Harness 的**跨会话上下文接力**插件。
 
 dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的是**同一会话内**上下文膨胀——隐藏旧条目、保留尾部。它解决不了另一件事：**新会话永远从零开始**。这个插件补的就是那个缺口。
@@ -14,6 +16,19 @@ dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的
 ④ 断点   compaction 压缩前自动落一份纯事实包：被压掉的细节之后还能 recall_context 找回
 ⑤ 检索   recall_context(query="...") 跨所有历史包（本机 + 远端镜像）全文检索
 ```
+
+## 安装
+
+npm 包名 `deepseek-harness-handoff`（`dsh-plugin` keyword 可在市场里搜到）。用官方 CLI 装，启动时自动加载：
+
+```sh
+dsh plugin --profile web add deepseek-harness-handoff      # Web 版
+dsh plugin --profile desktop add deepseek-harness-handoff  # 桌面版
+```
+
+装完重启 DSH。不想走 npm（或在内网/开发调试）就从源码挂载——把编译产物用 `cordis.patch.yml` 的 insert 指进去，见下面"跑起来"第 2 步。
+
+兼容性：按 dsh `0.2.1-rc.3` 的官方 `.d.ts` 编写（lib 与桌面版 DSH NEXT 内置的 `0.2.1-rc.2` 逐字节相同），已在桌面版实际验证；Web 版走同一套核心服务（tools / session events / agents），理论可用但未实测。只用到 `~/.dsh/` 下自己的目录，不写用户项目。
 
 ## 为什么"事实自动、结论手写"
 
@@ -87,7 +102,7 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 
 `--brief` 传 `{goal, summary, nextStep, openQuestions, refs}`，就能对比"只有事实"和"事实+结论"两种包。需要支持 zstd 的 Node（v22.15+ / v24+）。
 
-**2. 挂到桌面版 DSH NEXT**
+**2. 从源码挂载（开发/调试，不用 npm）**
 
 桌面版读 `~/.dsh/profiles/desktop/cordis.patch.yml`。在末尾加一段 insert，指向编译产物：
 

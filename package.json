@@ -1,16 +1,45 @@
 {
-  "name": "dsh-handoff",
+  "name": "deepseek-harness-handoff",
   "version": "0.6.0",
-  "private": true,
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "description": "Cross-session context handoff for DeepSeek Harness: monitor context pressure, distill a handoff pack, inject it into the next session.",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh-plugin",
+    "handoff",
+    "context",
+    "session",
+    "memory",
+    "continuity"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hrui83771-gif/dsh-handoff.git"
+  },
+  "homepage": "https://github.com/hrui83771-gif/dsh-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/hrui83771-gif/dsh-handoff/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "tsc",
     "smoke": "tsc && node scripts/smoke.mjs",
     "e2e": "tsc && node scripts/mock-run.mjs",
     "test": "tsc && node scripts/smoke.mjs && node scripts/mock-run.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@deepseek-ai/dsh-tools": "0.2.1-rc.3"
