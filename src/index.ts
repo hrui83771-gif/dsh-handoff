@@ -11,11 +11,12 @@
  *           细节由 recall_context 按需取，避免把膨胀问题搬过去
  */
 
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { dirname, isAbsolute, join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import { synthesizeBrief, synthEnabled } from './brief.js'
@@ -42,6 +43,7 @@ import {
   savePack,
   toL0,
   type HandoffPack,
+  type PackMeta,
 } from './pack.js'
 import { injectContext, onSessionEvent, registerCommand } from './compat.js'
 import {
@@ -85,6 +87,12 @@ export function apply(ctx: Context) {
   /** provider/model 路由 → 真实上下文窗口 */
   const windowByRoute = new Map<string, number>()
   const MEASURE_INTERVAL_MS = 5_000
+
+  /** 已经接过包的会话（startup 注入或延迟接力），防止重复注入 */
+  const restoredSessions = new Set<string>()
+  /** 延迟接力的尝试次数：按改动文件反推仓库根不是每次都能成，别无限试 */
+  const lateAttempts = new Map<string, number>()
+  const MAX_LATE_ATTEMPTS = 3
 
   /** 已解析过的窗口；没解析过返回 undefined（调用方负责触发解析） */
   const windowFor = (agent: Agent): number | undefined => windowByRoute.get(routeOf(agent))
@@ -154,6 +162,7 @@ export function apply(ctx: Context) {
         `[dsh-handoff] pack ${pack.id} 写于 ${formatAge(packAgeMs(pack))}（已过期线），注入时带了过时警告`,
       )
     }
+    restoredSessions.add(String(agent.session.id))
     console.log(
       `[dsh-handoff] restored pack ${pack.id}（会话 ${pack.fromSession}）→ 会话 ${agent.session.id}`,
     )
@@ -193,6 +202,138 @@ export function apply(ctx: Context) {
     return remote
   }
 
+  /**
+   * 延迟接力：startup 时没接到包（cwd 不在仓库里、或本机无记录），
+   * 等第一个带路径参数的工具调用落地，从改动文件反推仓库根，
+   * 再按 git origin 找远端镜像——覆盖"家目录开会话改别处仓库"的场景。
+   */
+  async function maybeLateRestore(session: Session, event: any): Promise<void> {
+    const id = String(session.id)
+    if (restoredSessions.has(id)) return
+    const attempts = lateAttempts.get(id) ?? 0
+    if (attempts >= MAX_LATE_ATTEMPTS) return
+
+    const agent = ctx.agents.get(session.id)
+    if (!agent) return
+    const header = agent.session.header
+    if (header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0) return
+
+    const raw = typeof event?.data?.arguments === 'string' ? event.data.arguments : ''
+    const dirs = candidateDirs(raw, String(session.header?.cwd ?? process.cwd()))
+    if (!dirs.length) return
+    lateAttempts.set(id, attempts + 1)
+
+    for (const dir of dirs) {
+      // git -C 会自己向上找仓库根，所以文件的所在目录就够
+      const facts = await gitFacts(dir)
+      if (!facts.remote) continue
+
+      const pack = await loadLatestPack(handoffRemoteRoot(facts.remote))
+      // 找到了远端目录但没有可用包：换目录再试没有意义，本会话就此作罢
+      if (!pack || pack.fromSession === id) return
+
+      const injected = injectContext(agent, {
+        text: toL0(pack, { stale: isStale(pack) }),
+        fromSession: pack.fromSession,
+        packId: pack.id,
+        form: 'recall',
+      })
+      if (!injected) return
+
+      restoredSessions.add(id)
+      console.log(
+        `[dsh-handoff] 延迟接力：会话 ${id} 的 cwd 不在仓库内，按改动文件（${dir}）` +
+          `反推出 ${facts.remote}，注入 pack ${pack.id}`,
+      )
+      ctx.emit('handoff/restored', {
+        agent,
+        workspace: resolveWorkspace(agent).label,
+        packId: pack.id,
+        fromSession: pack.fromSession,
+        at: new Date().toISOString(),
+      })
+      return
+    }
+  }
+
+  /** 从工具参数的 JSON 字符串里挑出真实存在的路径，取其所在目录 */
+  function candidateDirs(rawArgs: string, cwd: string): string[] {
+    const out: string[] = []
+    if (!rawArgs) return out
+
+    // 优先按 JSON 解析取值：正则按引号切分会被路径里的单引号坑掉
+    // （Windows 短目录名就有 HEN'R'~1 这种）
+    const candidates: string[] = []
+    let parsed: unknown = null
+    try {
+      parsed = JSON.parse(rawArgs)
+    } catch {
+      /* 非 JSON 参数：退回双引号正则 */
+    }
+    if (parsed && typeof parsed === 'object') {
+      collectStringValues(parsed, candidates)
+    } else {
+      const re = /"([^"\n]+\.[A-Za-z0-9]{1,6})"/g
+      for (const match of rawArgs.matchAll(re)) {
+        if (match[1]) candidates.push(match[1])
+      }
+    }
+
+    for (const path of candidates) {
+      if (!path || path.length > 300 || /^https?:/.test(path)) continue
+      if (!/\.[A-Za-z0-9]{1,6}$/.test(path)) continue
+      const dir = dirname(isAbsolute(path) ? path : join(cwd, path))
+      if (!existsSync(dir)) continue
+      if (!out.includes(dir)) out.push(dir)
+      if (out.length >= 3) break
+    }
+    return out
+  }
+
+  function collectStringValues(node: unknown, out: string[]): void {
+    if (typeof node === 'string') {
+      out.push(node)
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) collectStringValues(item, out)
+      return
+    }
+    if (node && typeof node === 'object') {
+      for (const value of Object.values(node as Record<string, unknown>)) {
+        collectStringValues(value, out)
+      }
+    }
+  }
+
+  /**
+   * compaction 断点：压缩的那一刻同样是丢上下文的时刻（旧细节被隐藏）。
+   * 落一份纯事实包（含失败教训），压缩后本会话还能 recall_context 找回来，
+   * 下个会话也会把它当最新接力包接走。
+   * 不补写结论：compaction 本身已经在跑模型请求，这里必须快。
+   */
+  async function compactionSnapshot(session: Session): Promise<void> {
+    const agent = ctx.agents.get(session.id)
+    if (!agent) return
+    const header = agent.session.header
+    if (header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0) return
+
+    try {
+      const ws = resolveWorkspace(agent)
+      const existing = await loadLatestPack(handoffRoot(ws))
+      // 本会话已经存过包（多半带模型结论）：别用断点包把更好的结论顶掉
+      if (existing?.fromSession === String(agent.session.id)) return
+
+      const { pack } = await createPack(agent, undefined, { trigger: 'compaction' })
+      console.log(
+        `[dsh-handoff] compaction 断点：已存 pack ${pack.id}` +
+          `（${pack.files.length} 文件 / ${pack.deadEnds.length} 条失败教训，压缩后可 recall_context 找回细节）`,
+      )
+    } catch (error) {
+      console.warn(`[dsh-handoff] compaction 断点落盘失败：${(error as Error)?.message ?? error}`)
+    }
+  }
+
   /* ---------------- ① 压力监测 ---------------- */
 
   ctx.on('agent/disposed', ({ agent }) => {
@@ -202,6 +343,18 @@ export function apply(ctx: Context) {
   })
 
   onSessionEvent(ctx, (session, event) => {
+    // compaction 前落断点包：被压掉的细节之后还能 recall_context 找回来。
+    // compaction/start 不在 rc.3 的事件类型联合里（桌面版 compaction 插件
+    // 以扩展事件写入日志），所以按字符串比较。
+    if (String(event.type) === 'compaction/start') {
+      void compactionSnapshot(session)
+      return
+    }
+    // startup 没接到包的会话：等第一个带路径的工具调用反推仓库根，补一次接力
+    if (event.type === 'tool/call') {
+      void maybeLateRestore(session, event)
+      return
+    }
     if (event.type !== 'step/end') return
 
     const id = String(session.id)
@@ -302,6 +455,34 @@ export function apply(ctx: Context) {
 
   /* ---------------- 工具：列出历史接力包 ---------------- */
 
+  /** 本机 + 远端镜像合并列表（handoff_list 工具和 /handoff list 共用） */
+  const listForWorkspace = async (ws: WorkspaceRef): Promise<PackMeta[]> => {
+    const local = await listPacks(handoffRoot(ws))
+
+    let remote: PackMeta[] = []
+    const facts = await gitFacts(ws.dir)
+    if (facts.remote) remote = await listPacks(handoffRemoteRoot(facts.remote))
+
+    // 本机的在前（更新鲜），按 id 去重
+    const seen = new Set(local.map((p) => p.id))
+    return [...local, ...remote.filter((p) => !seen.has(p.id))].slice(0, 10)
+  }
+
+  const renderPackList = (rows: PackMeta[]): string => {
+    if (!rows.length) return '(no handoff packs for this workspace)'
+    return rows
+      .map((p) => {
+        const tags = [
+          p.hasConclusion ? '' : '[纯事实]',
+          p.trigger === 'compaction' ? '[压缩断点]' : '',
+          p.trigger === 'pressure' ? '[压力兜底]' : '',
+        ].filter(Boolean)
+        const repo = p.git?.remote ? `  ${p.git.remote}` : ''
+        return `${p.id}  ${p.createdAt}（${p.age}）${tags.length ? ` ${tags.join(' ')}` : ''}${repo}\n  ${p.goal || '(无标题)'}\n  ${p.progress || '(无结论)'}`
+      })
+      .join('\n\n')
+  }
+
   ctx.tools.register(
     defineTool({
       name: 'handoff_list',
@@ -318,26 +499,7 @@ export function apply(ctx: Context) {
         const agent = ctx.agents.currentInitiator()
         if (!agent) return '(no active agent)'
 
-        const ws = resolveWorkspace(agent)
-        const local = await listPacks(handoffRoot(ws))
-
-        let remote: Awaited<ReturnType<typeof listPacks>> = []
-        const facts = await gitFacts(ws.dir)
-        if (facts.remote) remote = await listPacks(handoffRemoteRoot(facts.remote))
-
-        // 本机的在前（更新鲜），按 id 去重
-        const seen = new Set(local.map((p) => p.id))
-        const rows = [...local, ...remote.filter((p) => !seen.has(p.id))]
-        if (!rows.length) return '(no handoff packs for this workspace)'
-
-        return rows
-          .slice(0, 10)
-          .map((p) => {
-            const tag = p.hasConclusion ? '' : ' [纯事实]'
-            const repo = p.git?.remote ? `  ${p.git.remote}` : ''
-            return `${p.id}  ${p.createdAt}（${p.age}）${tag}${repo}\n  ${p.goal || '(无标题)'}\n  ${p.progress || '(无结论)'}`
-          })
-          .join('\n\n')
+        return renderPackList(await listForWorkspace(resolveWorkspace(agent)))
       },
     }),
   )
@@ -347,7 +509,7 @@ export function apply(ctx: Context) {
   const createPack = async (
     agent: Agent,
     brief?: PackBrief,
-    opts: { synthesize?: boolean } = {},
+    opts: { synthesize?: boolean; trigger?: HandoffPack['trigger'] } = {},
   ): Promise<{ pack: HandoffPack; file: string; synthesized: boolean }> => {
     const ws: WorkspaceRef = resolveWorkspace(agent)
     const window = await ensureWindow(agent)
@@ -370,7 +532,7 @@ export function apply(ctx: Context) {
     // 这时 cwd 不是仓库，等 buildPack 推出 projectRoot 再补一次。
     let git = await gitFacts(ws.dir)
 
-    let pack = buildPack({ ...input, brief, git })
+    let pack = buildPack({ ...input, brief, git, trigger: opts.trigger })
     if (!git.remote && pack.projectRoot) git = await gitFacts(pack.projectRoot)
 
     /**
@@ -384,11 +546,12 @@ export function apply(ctx: Context) {
         files: pack.files,
         commands: pack.commands,
         done: pack.done,
+        deadEnds: pack.deadEnds,
         recentPrompts: pack.recentPrompts,
         pressurePercent: Math.round(pack.pressure.ratio * 100),
       })
       if (filled?.summary) {
-        pack = buildPack({ ...input, brief: { ...brief, ...filled }, git })
+        pack = buildPack({ ...input, brief: { ...brief, ...filled }, git, trigger: opts.trigger })
         pack.conclusionSource = 'synth'
         synthesized = true
       }
@@ -439,7 +602,10 @@ export function apply(ctx: Context) {
       if (existing?.fromSession === String(agent.session.id)) return
 
       // 80% 时模型多半还没写结论：补一次结构化调用，失败就退回纯事实包
-      const { pack, synthesized } = await createPack(agent, undefined, { synthesize: true })
+      const { pack, synthesized } = await createPack(agent, undefined, {
+        synthesize: true,
+        trigger: 'pressure',
+      })
       console.log(
         `[dsh-handoff] 自动落盘 pack ${pack.id}（上下文 ${Math.round(pack.pressure.ratio * 100)}%，` +
           `${synthesized ? '结论由模型补写' : '纯事实，无模型结论'}）`,
@@ -517,7 +683,10 @@ export function apply(ctx: Context) {
         if (note) brief.nextStep = `${brief.nextStep ?? ''}\n- ${note}`.trim()
 
         // 没传 summary 时补一次模型调用；失败退回纯事实包
-        const { pack, file, synthesized } = await createPack(agent, brief, { synthesize: true })
+        const { pack, file, synthesized } = await createPack(agent, brief, {
+          synthesize: true,
+          trigger: 'manual',
+        })
 
         const lines = [
           `交接包已保存：${file}`,
@@ -525,6 +694,7 @@ export function apply(ctx: Context) {
           `目标：${pack.goal || '(空)'}`,
           `文件：${pack.files.length} 个${pack.stats.toolCalls ? `（共 ${pack.stats.toolCalls} 次工具调用）` : ''}`,
           `已完成待办：${pack.done.length} 项`,
+          pack.deadEnds.length ? `失败教训：${pack.deadEnds.length} 条（下个会话不会重蹈覆辙）` : '',
           `未决问题：${pack.openQuestions.length} 条`,
           pack.refs.length ? `详细交接：${pack.refs.join('、')}` : '',
           brief.summary
@@ -544,23 +714,90 @@ export function apply(ctx: Context) {
 
   registerCommand(ctx, {
     name: 'handoff',
-    description: '保存当前会话的交接包，供下一个会话自动接续',
-    hint: '<一句话结论>',
+    description: '保存/查看/恢复交接包：/handoff list | show <id> | restore <id> | <一句话结论>',
+    hint: '<一句话结论> | list | show <id> | restore <id>',
     // agent 由 CommandInvocation 带来（收到这条命令的那个会话），比
     // currentInitiator() 更准——多会话并存时不会指错对象。
     async run(args: string, agent: Agent) {
-      // /handoff [--to <会话id>] <一句话结论>
-      let text = args ?? ''
+      const text = args ?? ''
+      const ws = resolveWorkspace(agent)
+
+      /* -------- 子命令：list / show / restore -------- */
+
+      const subMatch = /^(list|ls|show|restore)\b\s*(\S+)?/i.exec(text.trim())
+      if (subMatch) {
+        const sub = (subMatch[1] ?? '').toLowerCase()
+        const id = subMatch[2] ?? ''
+
+        if (sub === 'list' || sub === 'ls') {
+          return ['本工作区的交接包（新的在前）：', '', renderPackList(await listForWorkspace(ws))].join('\n')
+        }
+
+        if (!id) return `⚠ 用法：/handoff ${sub} <包 id>（先 /handoff list 看 id）`
+        const pack = await loadPackForWorkspace(ws, id)
+        if (!pack) return `⚠ 没找到 id 为 ${id} 的交接包（本机 + 远端镜像都没有）。`
+
+        if (sub === 'show') {
+          const stale = isStale(pack)
+          return [
+            `pack ${pack.id}（${pack.createdAt}，写于 ${formatAge(packAgeMs(pack))}${stale ? '，⚠ 已过期' : ''}）`,
+            `来源会话：${pack.fromSession}${pack.fromTitle ? `（${pack.fromTitle}）` : ''}${pack.trigger ? `，落盘方式：${pack.trigger}` : ''}`,
+            '',
+            `目标：${pack.goal || '(空)'}`,
+            '',
+            '结论：',
+            pack.progress || '(无)',
+            '',
+            '下一步：',
+            pack.nextStep || '(无)',
+            pack.deadEnds.length ? ['', '试过但不行的：', ...pack.deadEnds.map((d) => `- ${d}`)].join('\n') : undefined,
+            pack.openQuestions.length
+              ? ['', '未决问题：', ...pack.openQuestions.map((q) => `- ${q}`)].join('\n')
+              : undefined,
+            '',
+            `改动文件 ${pack.files.length} 个 / 命令 ${pack.commands.length} 条 / 完成待办 ${pack.done.length} 项`,
+            `其余分节用 recall_context(section=..., packId=${pack.id}) 读取。`,
+          ]
+            .filter((l): l is string => l != null)
+            .join('\n')
+        }
+
+        // restore：把这份包的 L0 注入当前会话（startup 没接到 / 想换一份时用）
+        if (pack.fromSession === String(agent.session.id)) {
+          return `⚠ 包 ${pack.id} 就是当前会话存的，无需恢复到本会话。`
+        }
+        const stale = isStale(pack)
+        const injected = injectContext(agent, {
+          text: toL0(pack, { stale }),
+          fromSession: pack.fromSession,
+          packId: pack.id,
+          form: 'recall',
+        })
+        if (!injected) return `⚠ 注入包 ${pack.id} 失败（inject() 抛错）。`
+        restoredSessions.add(String(agent.session.id))
+        console.log(`[dsh-handoff] /handoff restore：pack ${pack.id} 注入会话 ${agent.session.id}`)
+        return [
+          `已把交接包 ${pack.id}（会话 ${pack.fromSession}，写于 ${formatAge(packAgeMs(pack))}）注入当前会话。`,
+          stale ? '⚠ 这份包已过期，摘要里带了过时警告。' : '下一条消息时生效。',
+        ].join('\n')
+      }
+
+      /* -------- 默认：保存 -------- */
+
+      let saveText = text
       let toSession: string | undefined
-      const toMatch = /(?:^|\s)--to\s+(\S+)/.exec(text)
+      const toMatch = /(?:^|\s)--to\s+(\S+)/.exec(saveText)
       if (toMatch) {
         toSession = toMatch[1]
-        text = text.replace(toMatch[0], ' ').trim()
+        saveText = saveText.replace(toMatch[0], ' ').trim()
       }
 
       // 剩下的话直接当 summary，避免"只存事实"；没给就补一次模型调用
-      const brief: PackBrief | undefined = text.trim() ? { summary: text.trim() } : undefined
-      const { pack, file, synthesized } = await createPack(agent, brief, { synthesize: true })
+      const brief: PackBrief | undefined = saveText.trim() ? { summary: saveText.trim() } : undefined
+      const { pack, file, synthesized } = await createPack(agent, brief, {
+        synthesize: true,
+        trigger: 'manual',
+      })
       const window = windowFor(agent)
       const pressure = window ? readPressure(ctx, agent.session, window) : null
       const head = pressure
@@ -582,10 +819,11 @@ export function apply(ctx: Context) {
         `- 改动文件：${pack.files.length} 个`,
         `- 命令：${pack.commands.length} 条`,
         `- 已完成待办：${pack.done.length} 项`,
+        pack.deadEnds.length ? `- 失败教训：${pack.deadEnds.length} 条` : '',
         `- 未决问题：${pack.openQuestions.length} 条`,
         '',
         '开一个新会话即可自动接续；需要细节时模型会调用 recall_context。',
-      ]
+      ].filter(Boolean)
 
       if (toSession) lines.push(deliverToSession(toSession, pack))
       return lines.join('\n')

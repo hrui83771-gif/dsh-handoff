@@ -17,23 +17,31 @@
  *  10. handoff_save toSession 投递给运行中的会话
  *  11. 结论自动补写（模型没传 summary 时一次结构化调用）+ 开关
  *  12. 过期包注入时带警告
+ *  13. compaction 前落断点包（trigger=compaction，失败教训一并保存）
+ *  14. /handoff 子命令：list / show <id> / restore <id>
+ *  15. 延迟接力：cwd 不在仓库内时，按改动文件反推仓库根补注入
  *
  * 全程用 DSH_HOME 指向临时目录，不碰用户真实的 ~/.dsh；
- * DSH_HANDOFF_NO_GIT=1 让 git 探测确定性地关闭（跨机接力的 git 逻辑在
- * smoke.mjs 里按纯函数单测）。
+ * DSH_HANDOFF_NO_GIT=1 让 git 探测确定性地关闭（第 15 段临时打开，
+ * 配一个真的 git 仓库验证反推链路；其余 git 逻辑在 smoke.mjs 按纯函数单测）。
  */
 
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
+
+const pExec = promisify(execFile)
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const home = await mkdtemp(join(tmpdir(), 'dsh-handoff-e2e-'))
 process.env.DSH_HOME = home
 process.env.DSH_HANDOFF_NO_GIT = '1'
 
 const { apply } = await import('../dist/index.js')
-const { PACK_VERSION, loadLatestPack } = await import('../dist/pack.js')
-const { resolveWorkspace } = await import('../dist/workspace.js')
+const { PACK_VERSION, loadLatestPack, mirrorLatest } = await import('../dist/pack.js')
+const { handoffRemoteRoot, resolveWorkspace } = await import('../dist/workspace.js')
 const { makeAgent, makeCtx, makeSession } = await import('./fixtures/mock-ctx.mjs')
 
 /* ---------------- 假 ctx ---------------- */
@@ -54,7 +62,7 @@ check('工具已注册 handoff_save', tools.has('handoff_save'))
 check('工具已注册 handoff_list', tools.has('handoff_list'))
 check('命令已注册 handoff', commands.has('handoff'))
 check('命令定义符合官方契约（handler 是函数）', typeof commands.get('handoff')?.handler === 'function')
-check('命令带了 composer 输入提示', commands.get('handoff')?.input?.hint === '<一句话结论>')
+check('命令带了 composer 输入提示', commands.get('handoff')?.input?.hint === '<一句话结论> | list | show <id> | restore <id>')
 check('挂了 agent/created', (handlers.get('agent/created') ?? []).length === 1)
 check('挂了 session/event', (handlers.get('session/event') ?? []).length === 1)
 
@@ -159,6 +167,18 @@ check('rawInput 作为 summary 写进了 pack', (cmdPack?.progress ?? '').includ
 const cmdText = (cmdPack?.commands ?? []).join('\n')
 check('密钥不落盘', !!cmdText && !cmdText.includes('sk-live-abcdef1234567890') && cmdText.includes('***'))
 
+/* ---------------- 9b. 失败教训蒸馏（deadEnds） ---------------- */
+
+const deadText = (packA?.deadEnds ?? []).join('\n')
+check('packA 记录失败的工具调用', deadText.includes('edit') && deadText.includes('ENOENT'))
+check('packA 标注重跑的命令', deadText.includes('跑了 2 次'))
+check('失败原因里的密钥也脱敏', !deadText.includes('sk-deadbeef123456'))
+check('成功的调用不进 deadEnds', !deadText.includes('call_pwsh_1'))
+check('handoff_save 结果提到失败教训', saveOut.includes('失败教训'))
+
+const deadSection = await tools.get('recall_context').execute({ section: 'deadEnds', packId: packA.id })
+check('recall_context 能取 deadEnds 分节', deadSection.includes('ENOENT'))
+
 /* ---------------- 10. handoff_list + packId 选历史包 ---------------- */
 
 const listOut = await tools.get('handoff_list').execute({})
@@ -233,6 +253,86 @@ const staleText = staleAgent.injected[0]?.content?.[0]?.text ?? ''
 check('过期包仍注入但带警告', staleText.includes('早已过期'))
 check('警告放在摘要最前面', staleText.trimStart().startsWith('⚠'))
 check('新鲜包不带警告', !(l0?.content?.[0]?.text ?? '').includes('早已过期'))
+
+/* ---------------- 13. compaction 断点 ---------------- */
+
+const compactAgent = setAgent(makeAgent('sess_compact_012'))
+await fire('session/event', compactAgent.session, { type: 'compaction/start', data: {} })
+await sleep(600)
+
+const compactPack = await loadLatestPack(workspaceDirOf(compactAgent))
+check('compaction/start 触发断点落盘', !!compactPack && compactPack.fromSession === 'sess_compact_012')
+check('断点包 trigger=compaction', compactPack?.trigger === 'compaction')
+check('断点包带失败教训', (compactPack?.deadEnds ?? []).length > 0)
+check('断点包是纯事实（不补写结论）', compactPack?.conclusionSource === 'activity')
+
+// 本会话已经存过包：断点不该用它把（可能更好的）包顶掉
+const compactId = compactPack?.id
+await fire('session/event', compactAgent.session, { type: 'compaction/start', data: {} })
+await sleep(600)
+const compactAfter = await loadLatestPack(workspaceDirOf(compactAgent))
+check('本会话已有包时断点不覆盖', compactAfter?.id === compactId)
+
+/* ---------------- 14. /handoff 子命令 ---------------- */
+
+const dispatch = (rawInput, agent) =>
+  commands.get('handoff').handler({
+    commandId: `cmd_${checks.length}`,
+    agent,
+    rawInput,
+    attachments: [],
+    signal: new AbortController().signal,
+  })
+
+const subAgent = setAgent(makeAgent('sess_subcmd_013'))
+const subList = await dispatch(' list', subAgent)
+check('/handoff list 返回包列表', subList?.kind === 'success' && (subList.text ?? '').includes(packA.id))
+
+const subShow = await dispatch(` show ${packA.id}`, subAgent)
+check('/handoff show 预览结论', (subShow?.text ?? '').includes('签发路径已切到 cookie'))
+check('/handoff show 带失败教训', (subShow?.text ?? '').includes('试过但不行的'))
+
+const subShowNoId = await dispatch(' show', subAgent)
+check('/handoff show 缺 id 给用法提示', (subShowNoId?.text ?? '').includes('用法'))
+
+const subRestore = await dispatch(` restore ${packA.id}`, subAgent)
+check('/handoff restore 注入当前会话', subAgent.injected.length === 1 && (subRestore?.text ?? '').includes('已把交接包'))
+
+const subMissing = await dispatch(' restore nosuch99', subAgent)
+check('/handoff restore 未命中给出提示', (subMissing?.text ?? '').includes('没找到'))
+
+/* ---------------- 15. 延迟接力（按改动文件反推仓库根） ---------------- */
+
+const repoDir = await mkdtemp(join(tmpdir(), 'dsh-handoff-repo-'))
+await mkdir(join(repoDir, 'src'), { recursive: true })
+await pExec('git', ['-C', repoDir, 'init'])
+await pExec('git', ['-C', repoDir, 'remote', 'add', 'origin', 'git@github.com:foo/bar.git'])
+await mirrorLatest(handoffRemoteRoot('github.com/foo/bar'), packA)
+
+delete process.env.DSH_HANDOFF_NO_GIT
+try {
+  const lateAgent = setAgent(makeAgent('sess_late_014'))
+  await fire('session/event', lateAgent.session, {
+    type: 'tool/call',
+    data: { turn: 1, name: 'edit', arguments: JSON.stringify({ file_path: join(repoDir, 'src', 'a.ts') }) },
+  })
+  await sleep(1_500)
+  check('延迟接力：按改动文件反推仓库根后注入', lateAgent.injected.length === 1)
+  check(
+    '延迟接力注入的是 L0 摘要',
+    (lateAgent.injected[0]?.content?.[0]?.text ?? '').includes('这是上一个会话的交接摘要'),
+  )
+
+  await fire('session/event', lateAgent.session, {
+    type: 'tool/call',
+    data: { turn: 2, name: 'edit', arguments: JSON.stringify({ file_path: join(repoDir, 'src', 'b.ts') }) },
+  })
+  await sleep(300)
+  check('已接力的会话不再重复注入', lateAgent.injected.length === 1)
+} finally {
+  process.env.DSH_HANDOFF_NO_GIT = '1'
+  await rm(repoDir, { recursive: true, force: true })
+}
 
 /* ---------------- 结果 ---------------- */
 

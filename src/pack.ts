@@ -17,6 +17,7 @@ export const PACK_SECTIONS = [
   'nextStep',
   'files',
   'commands',
+  'deadEnds',
   'refs',
   'openQuestions',
   'prompts',
@@ -70,6 +71,8 @@ export interface HandoffPack {
   progress: string
   /** progress 从哪来：brief=会话中模型亲口写的，synth=落盘时补调的，activity=纯事实统计 */
   conclusionSource?: 'brief' | 'synth' | 'activity'
+  /** 这份包是谁落的：手动保存 / 80% 压力兜底 / compaction 前断点 */
+  trigger?: 'manual' | 'pressure' | 'compaction'
   nextStep: string
   /** 改动过的文件，按改动次数排序 */
   files: string[]
@@ -77,6 +80,8 @@ export interface HandoffPack {
   commands: string[]
   /** todo/write 里已完成的项目 */
   done: string[]
+  /** 试过但不行的：失败的工具调用、反复重跑的命令——别让下个会话重蹈覆辙 */
+  deadEnds: string[]
   /** 需要下个会话直接去读的文件（手写交接文档等），绝对路径 */
   refs: string[]
   openQuestions: string[]
@@ -174,6 +179,7 @@ export interface PackMeta {
   progress: string
   hasConclusion: boolean
   pressurePercent: number
+  trigger?: HandoffPack['trigger']
   git?: HandoffPack['git']
 }
 
@@ -200,6 +206,7 @@ export async function listPacks(dir: string, limit = 10): Promise<PackMeta[]> {
           progress: (pack.progress ?? '').split('\n')[0] ?? '',
           hasConclusion: pack.conclusionSource !== 'activity' && !!(pack.progress ?? '').trim(),
           pressurePercent: Math.round((pack.pressure?.ratio ?? 0) * 100),
+          trigger: pack.trigger,
           git: pack.git,
         })
       } catch {
@@ -253,6 +260,8 @@ export function toL0(pack: HandoffPack, options: { stale?: boolean } = {}): stri
   add('详细交接（先读这些文件）', list(pack.refs, 5))
   add('下一步', pack.nextStep)
   add('本次会话的结论', pack.progress)
+  // 失败教训价值密度极高：新会话最贵的浪费就是重蹈覆辙
+  add('试过但不行的方案（不要重复踩）', list(pack.deadEnds ?? [], 6))
   add('已完成', list(pack.done, 15))
   add('改动最多的文件', list(pack.files, 20))
   add('未决问题', list(pack.openQuestions, 8))
@@ -284,7 +293,7 @@ export function toL0(pack: HandoffPack, options: { stale?: boolean } = {}): stri
     `，交接时上下文 ${Math.round(pack.pressure.ratio * 100)}%，写于 ${formatAge(packAgeMs(pack))}）。` +
     `${scale}${project}${repo}` +
     `摘要只保留结论，可能不完整：需要细节时调用 recall_context（` +
-    `focus / progress / done / files / commands / refs / prompts / openQuestions），` +
+    `focus / progress / done / files / commands / deadEnds / refs / prompts / openQuestions），` +
     `不要凭摘要臆测未列出的内容。`
 
   let out = header
@@ -305,6 +314,7 @@ export function buildSections(pack: Omit<HandoffPack, 'sections'>): Record<strin
     nextStep: pack.nextStep,
     files: pack.files.map((f) => `- ${f}`).join('\n'),
     commands: pack.commands.map((c) => `- \`${c}\``).join('\n'),
+    deadEnds: (pack.deadEnds ?? []).map((d) => `- ${d}`).join('\n'),
     refs: pack.refs.map((r) => `- ${r}`).join('\n'),
     openQuestions: pack.openQuestions.map((q) => `- ${q}`).join('\n'),
     prompts: pack.recentPrompts.map((p, i) => `### ${i + 1}\n${p}`).join('\n\n'),

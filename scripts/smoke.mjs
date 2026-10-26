@@ -78,7 +78,7 @@ const checks = [
   ['没有模型结论时 progress 只陈述事实', factsOnly.progress.includes('7 轮') && !factsOnly.progress.includes('不过说实话')],
   ['meta 提问不进 recentPrompts', !factsOnly.recentPrompts.some((p) => p.includes('交接包'))],
   ['runtime-context 不进 recentPrompts', !factsOnly.recentPrompts.some((p) => p.includes('runtime-context'))],
-  ['stats 记录规模', factsOnly.stats.turns === 7 && factsOnly.stats.toolCalls === 6],
+  ['stats 记录规模', factsOnly.stats.turns === 7 && factsOnly.stats.toolCalls === 7],
   ['模型 brief 覆盖 goal', withBrief.goal === '把 auth 从 JWT 换成 cookie'],
   ['模型 brief 覆盖 progress', withBrief.progress === '签发路径已切换，导出和测试还没收尾。'],
   ['模型 nextStep 带上未完成待办', withBrief.nextStep.startsWith('改完 index.ts') && withBrief.nextStep.includes('补 session 过期测试')],
@@ -92,6 +92,28 @@ const checks = [
   ['recall 能取 refs 分节', (readSection(withBrief, 'refs') ?? '').includes('HANDOFF.md')],
   ['未知分节返回 null', readSection(withBrief, 'nope') === null],
 ]
+
+/* ---------------- 失败教训（deadEnds） ---------------- */
+
+const withTrigger = buildPack({
+  session: fakeSession,
+  workspaceDir: dir,
+  window: 1_000_000,
+  pressure: { totalTokens: 812_000, window: 1_000_000, ratio: 0.812 },
+  trigger: 'compaction',
+})
+
+checks.push(
+  ['deadEnds 记录失败的工具调用', factsOnly.deadEnds.some((d) => d.includes('edit') && d.includes('FileNotFoundError'))],
+  ['deadEnds 标注重跑的命令', factsOnly.deadEnds.some((d) => d.includes('跑了 2 次'))],
+  ['成功的调用不进 deadEnds', !factsOnly.deadEnds.some((d) => d.includes('multi_edit'))],
+  ['deadEnds 去重封顶 10 条', factsOnly.deadEnds.length <= 10 && new Set(factsOnly.deadEnds).size === factsOnly.deadEnds.length],
+  ['recall 能取 deadEnds 分节', (readSection(factsOnly, 'deadEnds') ?? '').includes('FileNotFoundError')],
+  ['L0 带失败教训块', toL0(withBrief).includes('试过但不行的方案')],
+  ['deadEnds 里的密钥也脱敏', !factsOnly.deadEnds.join('\n').includes('sk-deadbeef123456')],
+  ['trigger 写进 pack', withTrigger.trigger === 'compaction'],
+  ['默认（不传 trigger）不写字段', factsOnly.trigger === undefined],
+)
 
 /* ---------------- 注入路径（用假 agent，不需要 dsh） ---------------- */
 

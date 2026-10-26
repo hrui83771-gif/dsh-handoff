@@ -31,8 +31,21 @@ export const makeSession = (id, overrides = {}) => ({
   ],
   snapshotEvents: () => [
     { type: 'session/title', data: { title: 'Auth 迁 cookie' } },
-    { type: 'tool/call', data: { turn: 1, name: 'edit', arguments: '{"file_path":"src/auth/session.ts"}' } },
-    { type: 'tool/call', data: { turn: 2, name: 'pwsh', arguments: '{"command":"pnpm test"}' } },
+    {
+      type: 'tool/call',
+      data: { turn: 1, callId: 'call_edit_ok', name: 'edit', arguments: '{"file_path":"src/auth/session.ts"}' },
+    },
+    {
+      type: 'tool/call',
+      data: { turn: 2, callId: 'call_pwsh_1', name: 'pwsh', arguments: '{"command":"pnpm test"}' },
+    },
+    {
+      type: 'tool/result',
+      data: {
+        turn: 2,
+        message: { role: 'tool', toolCallId: 'call_pwsh_1', isError: false, content: [{ type: 'text', text: 'ok' }] },
+      },
+    },
     // 故意带一条高熵密钥：验证落盘前会被脱敏
     {
       type: 'tool/call',
@@ -40,6 +53,33 @@ export const makeSession = (id, overrides = {}) => ({
         turn: 2,
         name: 'pwsh',
         arguments: '{"command":"curl -H \\"Authorization: Bearer sk-live-abcdef1234567890\\" https://api.example.com/deploy"}',
+      },
+    },
+    // 同一命令再跑一次（第一次多半没成功）→ deadEnds 应标注重跑
+    {
+      type: 'tool/call',
+      data: { turn: 3, callId: 'call_pwsh_2', name: 'pwsh', arguments: '{"command":"pnpm test"}' },
+    },
+    // 失败的工具调用 → deadEnds；reason 里再带一条密钥验证脱敏
+    {
+      type: 'tool/call',
+      data: { turn: 3, callId: 'call_edit_fail', name: 'edit', arguments: '{"file_path":"src/auth/expired.ts"}' },
+    },
+    {
+      type: 'tool/result',
+      data: {
+        turn: 3,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_edit_fail',
+          isError: true,
+          content: [{ type: 'text', text: 'ENOENT: no such file src/auth/expired.ts' }],
+        },
+        error: {
+          name: 'EditError',
+          code: 'ENOENT',
+          reason: 'ENOENT: no such file src/auth/expired.ts (token=sk-deadbeef123456)',
+        },
       },
     },
     {
@@ -130,8 +170,26 @@ export const makeRichSession = () => ({
       type: 'tool/call',
       data: {
         turn: 1,
+        callId: 'call_rich_1',
         name: 'edit',
         arguments: '{"file_path":"src/auth/session.ts"}',
+      },
+    },
+    {
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        message: {
+          role: 'tool',
+          toolCallId: 'call_rich_1',
+          isError: true,
+          content: [{ type: 'text', text: 'FileNotFoundError: src/auth/session.ts is read-only' }],
+        },
+        error: {
+          name: 'EditError',
+          code: 'EROFS',
+          reason: 'FileNotFoundError: src/auth/session.ts is read-only (token=sk-deadbeef123456)',
+        },
       },
     },
     {
@@ -156,6 +214,15 @@ export const makeRichSession = () => ({
         turn: 3,
         name: 'pwsh',
         arguments: '{"command":"pnpm test src/auth --run\\n# 长输出省略"}',
+      },
+    },
+    {
+      // 同一命令重跑（第一次多半失败）→ deadEnds 标注
+      type: 'tool/call',
+      data: {
+        turn: 4,
+        name: 'pwsh',
+        arguments: '{"command":"pnpm test src/auth --run\\n# 第二次"}',
       },
     },
     {

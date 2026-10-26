@@ -26,6 +26,8 @@ export interface BriefFacts {
   files: string[]
   commands: string[]
   done: string[]
+  /** 试过但不行的（失败调用/重试命令）：写 nextStep 时必须绕开 */
+  deadEnds: string[]
   recentPrompts: string[]
   pressurePercent: number
 }
@@ -57,6 +59,9 @@ export function buildPrompt(facts: BriefFacts): string {
   if (facts.files.length) lines.push(`Files touched:\n${facts.files.slice(0, MAX_LIST_ITEMS).map((f) => `- ${f}`).join('\n')}`)
   if (facts.commands.length) lines.push(`Commands run:\n${facts.commands.slice(0, MAX_LIST_ITEMS).map((c) => `- ${c}`).join('\n')}`)
   if (facts.done.length) lines.push(`Todos completed:\n${facts.done.slice(0, MAX_LIST_ITEMS).map((d) => `- ${d}`).join('\n')}`)
+  if (facts.deadEnds.length) {
+    lines.push(`Failed attempts / retried commands (do NOT propose these again):\n${facts.deadEnds.slice(0, MAX_LIST_ITEMS).map((d) => `- ${d}`).join('\n')}`)
+  }
   if (facts.recentPrompts.length) lines.push(`Recent user prompts:\n${facts.recentPrompts.map((p) => `- ${p}`).join('\n')}`)
   return lines.join('\n\n')
 }

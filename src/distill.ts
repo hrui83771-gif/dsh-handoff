@@ -55,6 +55,9 @@ const IGNORED = /(^|[\\/])(node_modules|\.git|dist|build|\.next|target|__pycache
 /** 交接动作本身不该变成"用户目标"或"最近在做的事" */
 const META_PROMPT = /(handoff_save|\/handoff|交接包|把当前会话存成)/i
 
+/** 插件自己的工具：它们的失败不是"用户方案失败"，不进 deadEnds */
+const OWN_TOOLS = /^(handoff_save|handoff_list|recall_context|handoff)$/i
+
 /** 构建/测试/提交类命令：接力时真正需要复现的就是这些 */
 const BUILD_LIKE =
   /(^|[\s;&|(])(go\s+(build|test|vet|run|mod|generate)|npm|pnpm|yarn|npx|node|tsc|python3?|pytest|make|cargo|dotnet|gradle|mvn|web_build|git\s+(commit|push|status|diff|log|add))(\s|$)/i
@@ -112,6 +115,8 @@ export interface DistillInput {
   brief?: PackBrief
   /** 仓库身份（remote/branch/commit），跨机器接力用；没有就不写进 pack */
   git?: GitFacts
+  /** 这份包是谁落的（manual / pressure / compaction） */
+  trigger?: HandoffPack['trigger']
 }
 
 export function buildPack(input: DistillInput): HandoffPack {
@@ -143,6 +148,11 @@ export function buildPack(input: DistillInput): HandoffPack {
   const fileHits = new Map<string, number>()
   const commands: string[] = []
   const todoHistory: PackTodo[][] = []
+  /** 命令 → 出现次数：同一命令反复重跑，多半是第一次没成功 */
+  const commandCounts = new Map<string, number>()
+  /** callId → 调用信息：给 tool/result 的失败结果配对出"是哪个工具、干了什么" */
+  const calls = new Map<string, { name: string }>()
+  const deadEndsRaw: string[] = []
   let title = ''
   let turns = 0
   let toolCalls = 0
@@ -156,16 +166,38 @@ export function buildPack(input: DistillInput): HandoffPack {
       if (Number.isFinite(turn) && turn > turns) turns = turn
 
       const name = String(event.data?.name ?? '')
+      const callId = String(event.data?.callId ?? '')
+      if (callId) calls.set(callId, { name })
+
       const args = parseArgs(event.data?.arguments)
       if (!args) continue
 
       if (SHELL.test(name)) {
         const cmd = firstLine(args.command ?? args.cmd ?? args.script)
-        if (cmd) pushUnique(commands, truncate(redactCommand(cmd), 200))
+        if (cmd) {
+          const redacted = truncate(redactCommand(cmd), 200)
+          pushUnique(commands, redacted)
+          commandCounts.set(redacted, (commandCounts.get(redacted) ?? 0) + 1)
+        }
         continue
       }
       if (!MUTATING.test(name) || NOT_MUTATING.test(name)) continue
       collectPaths(args, fileHits)
+    } else if (type === 'tool/result') {
+      // 失败的工具调用 = 试过但不行的方案。reason 在 model-facing 内容之外，
+      // 优先取它；没有就取结果文本首行。插件自己的工具失败不算。
+      const message = event.data?.message
+      const failed = message?.isError === true || !!event.data?.error
+      if (!failed) continue
+
+      const call = calls.get(String(message?.toolCallId ?? ''))
+      const toolName = call?.name ?? '(未知工具)'
+      if (OWN_TOOLS.test(toolName)) continue
+
+      const reason =
+        firstLine(event.data?.error?.reason) ||
+        firstLine(textOf(Array.isArray(message?.content) ? message.content : []))
+      deadEndsRaw.push(truncate(redactCommand(`${toolName}：${reason || '失败（无原因记录）'}`), 220))
     } else if (type === 'todo/write') {
       if (Array.isArray(event.data?.todos)) {
         todoHistory.push(normalizeTodos(event.data.todos))
@@ -184,6 +216,23 @@ export function buildPack(input: DistillInput): HandoffPack {
   if (fileHits.size === 0 && commands.length === 0) {
     for (const message of messages) collectFromMessage(message, fileHits, commands)
   }
+
+  // 失败教训的兜底：投影里的 tool 角色消息带 isError（事件缺席时走这条）
+  if (!deadEndsRaw.length) {
+    for (const message of messages) {
+      if (message?.role !== 'tool' || message.isError !== true) continue
+      const reason = firstLine(textOf(Array.isArray(message.content) ? message.content : []))
+      deadEndsRaw.push(truncate(redactCommand(`工具失败：${reason || '（无原因记录）'}`), 220))
+    }
+  }
+
+  // 反复重跑的命令：同一命令出现 ≥2 次，第一次多半失败了
+  for (const [cmd, count] of commandCounts) {
+    if (count >= 2) deadEndsRaw.push(`命令跑了 ${count} 次（第一次多半没成功）：${truncate(cmd, 140)}`)
+  }
+
+  // 去重保序，封顶 10 条——deadEnds 是给 L0 和补写提示词用的，不是全量日志
+  const deadEnds = [...new Set(deadEndsRaw)].slice(0, 10)
 
   const files = rankFiles(fileHits)
   const { done, pending } = mergeTodos(todoHistory)
@@ -244,10 +293,12 @@ export function buildPack(input: DistillInput): HandoffPack {
     focus,
     progress,
     conclusionSource: brief.summary?.trim() ? 'brief' : 'activity',
+    trigger: input.trigger,
     nextStep,
     files: files.slice(0, 200),
     commands: rankCommands(commands).slice(0, 40),
     done: done.slice(0, 40),
+    deadEnds,
     refs,
     openQuestions,
     recentPrompts: realPrompts.slice(-3).map((p) => truncate(p, 400)),
