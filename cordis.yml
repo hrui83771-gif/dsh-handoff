@@ -3,4 +3,4 @@
 # name 必须是绝对路径（Windows 用正斜杠，反斜杠在 YAML 里要转义）。
 - insert:
     - id: handoff
-      name: "C:/Users/hen'r'y'hu'g'y/Documents/默认项目/src/index.ts"
+      name: "D:/BCGD/dsh-handoff/dist/index.js"

@@ -83,7 +83,7 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 ```yaml
 - insert:
     - id: handoff
-      name: "C:/Users/hen'r'y'hu'g'y/Documents/默认项目/dist/index.js"
+      name: "D:/BCGD/dsh-handoff/dist/index.js"
 ```
 
 重启 DSH NEXT，`~/.dsh/logs/desktop-next.log` 里应出现：
