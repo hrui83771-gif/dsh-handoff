@@ -1,0 +1,26 @@
+{
+  "name": "dsh-handoff",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "description": "Cross-session context handoff for DeepSeek Harness: monitor context pressure, distill a handoff pack, inject it into the next session.",
+  "scripts": {
+    "build": "tsc",
+    "smoke": "tsc && node scripts/smoke.mjs",
+    "e2e": "tsc && node scripts/mock-run.mjs",
+    "test": "tsc && node scripts/smoke.mjs && node scripts/mock-run.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-token-meter": "0.2.1-rc.2",
+    "@types/node": "^22.10.0"
+  }
+}

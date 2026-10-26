@@ -1,0 +1,6 @@
+# Web 覆盖层：把本地插件插进默认 web profile。
+# 用法：pnpm dsh web --patch ./cordis.yml
+# name 必须是绝对路径（Windows 用正斜杠，反斜杠在 YAML 里要转义）。
+- insert:
+    - id: handoff
+      name: "C:/Users/hen'r'y'hu'g'y/Documents/默认项目/src/index.ts"
