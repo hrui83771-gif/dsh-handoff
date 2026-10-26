@@ -20,6 +20,8 @@
  *  13. compaction 前落断点包（trigger=compaction，失败教训一并保存）
  *  14. /handoff 子命令：list / show <id> / restore <id>
  *  15. 延迟接力：cwd 不在仓库内时，按改动文件反推仓库根补注入
+ *  16. 多次接力后 L0 带演化弧线 + 文件/待办只带增量
+ *  17. recall_context(query=...) 跨历史包全文检索
  *
  * 全程用 DSH_HOME 指向临时目录，不碰用户真实的 ~/.dsh；
  * DSH_HANDOFF_NO_GIT=1 让 git 探测确定性地关闭（第 15 段临时打开，
@@ -333,6 +335,35 @@ try {
   process.env.DSH_HANDOFF_NO_GIT = '1'
   await rm(repoDir, { recursive: true, force: true })
 }
+
+/* ---------------- 16. 弧线 + 差异注入 ---------------- */
+
+// 此刻共享工作区已有多份接力包：新会话 startup 注入时应看到演化弧线，
+// 且文件/待办只带相对前几次的增量（fixture 各包文件相同 → 全是注脚）
+const arcAgent = setAgent(makeAgent('sess_arc_015'))
+await fire('agent/created', { agent: arcAgent, source: 'startup' })
+const arcText = arcAgent.injected[0]?.content?.[0]?.text ?? ''
+check('多次接力后 L0 带演化弧线', arcText.includes('近几次交接的演化'))
+check('弧线包含前几次的标题', arcText.includes('Auth 迁 cookie'))
+check('弧线带年龄文案', /- \d+ (分钟|小时|天)前「|剛剛|刚刚「/.test(arcText))
+check('文件全重复时用注脚代替全量', arcText.includes('个文件在前几次交接里'))
+check('已完成待办同样只带增量', arcText.includes('项在前几次交接里'))
+check('弧线 L0 仍有预算上限', arcText.length <= 4000)
+
+/* ---------------- 17. 全文检索 ---------------- */
+
+const hitOut = await tools.get('recall_context').execute({ query: 'cookie' })
+check('recall query 跨包命中', hitOut.includes('pack ') && hitOut.includes('·'))
+check('recall query 命中行带分节名', /· (goal|focus|progress|done|nextStep|files|commands|deadEnds|refs|openQuestions|prompts) ·/.test(hitOut))
+
+const scopedOut = await tools.get('recall_context').execute({ query: 'cookie', section: 'progress' })
+check('recall query + section 只搜该分节', scopedOut.includes('· progress ·'))
+
+const queryMiss = await tools.get('recall_context').execute({ query: 'zzz-no-such-token-zzz' })
+check('recall query 无命中给出说明', queryMiss.includes('没有命中'))
+
+const noArgsOut = await tools.get('recall_context').execute({})
+check('recall 无参数给出用法提示', noArgsOut.includes('specify a section'))
 
 /* ---------------- 结果 ---------------- */
 

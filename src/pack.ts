@@ -168,6 +168,30 @@ export async function loadPackById(dir: string, id: string): Promise<HandoffPack
   }
 }
 
+/** 读最近的完整包（新的在前）。给 L0 弧线/增量注入和全文检索用。 */
+export async function loadRecentPacks(dir: string, limit = 4): Promise<HandoffPack[]> {
+  try {
+    const files = (await readdir(dir))
+      .filter((f) => f.endsWith('.json') && f !== 'latest.json')
+      .sort()
+      .reverse()
+      .slice(0, limit)
+
+    const out: HandoffPack[] = []
+    for (const file of files) {
+      try {
+        const pack = JSON.parse(await readFile(join(dir, file), 'utf8')) as HandoffPack
+        if (pack?.version === PACK_VERSION) out.push(pack)
+      } catch {
+        /* 单个包损坏不影响整体 */
+      }
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
 /** 列表条目：够 L0/工具输出用的最小元数据 */
 export interface PackMeta {
   id: string
@@ -243,8 +267,15 @@ export function readSection(pack: HandoffPack, section: string): string | null {
  *
  * 只放"不看就会走错路"的信息，其余全部留给 recall_context。
  * 按优先级整块累加，超预算就整块跳过——不切半行，免得把"下一步"截成半句。
+ *
+ * options.previous 传前几次接力包时启用两件事：
+ *   多包合并 —— 头部带"近几次交接的演化"弧线，中间会话不再丢；
+ *   差异注入 —— 文件/已完成待办只带相对前几次的增量，重复内容不再重复罗列。
  */
-export function toL0(pack: HandoffPack, options: { stale?: boolean } = {}): string {
+export function toL0(
+  pack: HandoffPack,
+  options: { stale?: boolean; previous?: HandoffPack[] } = {},
+): string {
   const list = (items: string[], max: number, bullet = '- ') =>
     items.slice(0, max).map((i) => `${bullet}${i}`).join('\n')
 
@@ -254,16 +285,52 @@ export function toL0(pack: HandoffPack, options: { stale?: boolean } = {}): stri
     if (text) candidates.push([title, text])
   }
 
+  // 差异注入：前几次交接已经给过的不再重复
+  const previous = (options.previous ?? []).filter((p) => p.id !== pack.id).slice(0, 3)
+  const priorFiles = new Set(previous.flatMap((p) => p.files ?? []))
+  const priorDone = new Set(previous.flatMap((p) => p.done ?? []))
+  const deltaFiles = (pack.files ?? []).filter((f) => !priorFiles.has(f))
+  const deltaDone = (pack.done ?? []).filter((d) => !priorDone.has(d))
+
+  /** 增量列表 + "其余见前几次交接"的注脚（没有被吞掉的内容就不加注脚） */
+  const deltaBody = (delta: string[], all: string[], section: string, max: number): string => {
+    const hidden = all.length - delta.length
+    const note =
+      hidden > 0
+        ? `（另有 ${hidden} ${section === 'done' ? '项' : '个文件'}在前几次交接里，细节用 recall_context('${section}')）`
+        : ''
+    return [list(delta, max), note].filter(Boolean).join('\n')
+  }
+
+  // 多包合并：演化弧线按时间顺序（previous 是新的在前）
+  const arc = previous.length
+    ? previous
+        .slice()
+        .reverse()
+        .map((p) => {
+          const progress = (p.progress ?? '').split('\n')[0] || '(纯事实包)'
+          return `- ${formatAge(packAgeMs(p))}「${truncate(p.goal || '(无标题)', 60)}」：${truncate(progress, 100)}`
+        })
+        .join('\n')
+    : ''
+
   // 顺序就是重要性顺序
   add('目标', pack.goal)
   add('交接点（最后一条用户请求）', pack.focus)
+  add('近几次交接的演化（更早的演化不在此处，细节用 recall_context）', arc)
   add('详细交接（先读这些文件）', list(pack.refs, 5))
   add('下一步', pack.nextStep)
   add('本次会话的结论', pack.progress)
   // 失败教训价值密度极高：新会话最贵的浪费就是重蹈覆辙
   add('试过但不行的方案（不要重复踩）', list(pack.deadEnds ?? [], 6))
-  add('已完成', list(pack.done, 15))
-  add('改动最多的文件', list(pack.files, 20))
+  add(
+    '已完成',
+    previous.length ? deltaBody(deltaDone, pack.done ?? [], 'done', 15) : list(pack.done, 15),
+  )
+  add(
+    '改动最多的文件',
+    previous.length ? deltaBody(deltaFiles, pack.files ?? [], 'files', 20) : list(pack.files, 20),
+  )
   add('未决问题', list(pack.openQuestions, 8))
 
   const scale =
@@ -294,6 +361,7 @@ export function toL0(pack: HandoffPack, options: { stale?: boolean } = {}): stri
     `${scale}${project}${repo}` +
     `摘要只保留结论，可能不完整：需要细节时调用 recall_context（` +
     `focus / progress / done / files / commands / deadEnds / refs / prompts / openQuestions），` +
+    `跨历史包搜索用 recall_context(query="...")，` +
     `不要凭摘要臆测未列出的内容。`
 
   let out = header

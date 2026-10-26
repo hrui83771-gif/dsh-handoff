@@ -10,7 +10,9 @@ dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的
 ③ 注入   新会话 startup 时自动注入 L0 摘要，细节由 recall_context 按需取
          过期包（默认 3 天）注入时带显式警告；本机没有就按 git remote 找镜像；
          cwd 不在仓库内时，等第一个带路径的工具调用反推仓库根再补一次（延迟接力）
+         连续接力时 L0 带"近几次交接的演化"弧线，文件/待办只带相对前几次的增量
 ④ 断点   compaction 压缩前自动落一份纯事实包：被压掉的细节之后还能 recall_context 找回
+⑤ 检索   recall_context(query="...") 跨所有历史包（本机 + 远端镜像）全文检索
 ```
 
 ## 为什么"事实自动、结论手写"
@@ -32,9 +34,11 @@ dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的
 
 | 层 | 内容 | 体量 | 何时进上下文 |
 |---|---|---|---|
-| L0 | 目标、交接点、详细交接指针、下一步、结论、失败教训、已完成、改动文件、未决问题 | ≤ 4000 字符 | 新会话自动注入 |
-| L1 | focus / progress / done / files / commands / deadEnds / refs / prompts / openQuestions 分节 | 每节按需 | 模型调 `recall_context(section)` |
+| L0 | 目标、交接点、演化弧线、详细交接指针、下一步、结论、失败教训、已完成（增量）、改动文件（增量）、未决问题 | ≤ 4000 字符 | 新会话自动注入 |
+| L1 | focus / progress / done / files / commands / deadEnds / refs / prompts / openQuestions 分节 | 每节按需 | 模型调 `recall_context(section)`；`query` 则跨全部历史包全文检索 |
 | L2 | 原始会话 | 不限 | 用 `fromSession` 回溯 |
+
+**多包合并与差异注入**：连续接力多个会话后，L0 头部带"近几次交接的演化"弧线（前 3 份包的时间序一句话摘要），中间会话不再丢；文件和已完成待办只带**相对前几次的增量**，重复内容不重复罗列，被吞掉的数量以注脚说明（"另有 N 个文件在前几次交接里"）。弧线只看本机包链（远端镜像只存 latest）。
 
 ## 目录
 
@@ -50,8 +54,8 @@ src/
 └─ compat.ts     # 唯一对接 dsh 类型/事件的文件，dsh 升级后先看这里
 dist/            # tsc 产物，dsh 实际加载的是这里
 scripts/
-├─ smoke.mjs          # 离线冒烟测试，直接测 dist（64 项断言）
-├─ mock-run.mjs       # 假 ctx 端到端：apply() → 注入/投递/补写/断点/延迟接力（44 项断言）
+├─ smoke.mjs          # 离线冒烟测试，直接测 dist（70 项断言）
+├─ mock-run.mjs       # 假 ctx 端到端：apply() → 注入/投递/补写/断点/延迟接力/弧线/检索（48 项断言）
 ├─ fixtures/mock-ctx.mjs # 共享假环境：会话/agent/ctx，两个测试共用一套契约
 ├─ replay-distill.mjs # 拿真实会话日志回放蒸馏，可 --brief / --save
 ├─ verify-pack.mjs    # 只读校验落盘包 + 预览 L0
@@ -67,12 +71,12 @@ scripts/
 ```sh
 pnpm install      # 装 @deepseek-ai/dsh-tools@0.2.1-rc.3 和类型
 pnpm build        # tsc → dist/
-pnpm test         # 冒烟 64 项 + 端到端 44 项
+pnpm test         # 冒烟 70 项 + 端到端 48 项
 ```
 
-冒烟测试直接测 `dist/`——也就是 dsh 真正加载的那份 JS：事实派生（文件/命令/待办合并/标题/失败教训）、结论合并、L0 预算裁剪、refs 解析、注入消息形状、工作区 key 稳定性、上下文窗口解析，以及命令脱敏、远端 key、新鲜度、历史包列表、`parseBrief` 解析。
+冒烟测试直接测 `dist/`——也就是 dsh 真正加载的那份 JS：事实派生（文件/命令/待办合并/标题/失败教训）、结论合并、L0 预算裁剪（含弧线/增量）、refs 解析、注入消息形状、工作区 key 稳定性、上下文窗口解析，以及命令脱敏、远端 key、新鲜度、历史包列表、多包读取、`parseBrief` 解析。
 
-`mock-run.mjs` 用假 ctx 真的调用 `apply()`：工具/命令注册、`agent/created(startup)` 注入、`resume`/subagent 跳过、`recall_context` 分节（含 `packId` 和 `deadEnds`）、80% 自动落盘、`/handoff` 官方 `handler` 契约、命令脱敏、`handoff_list`、`toSession` 投递、结论自动补写（含关闭开关）、过期包警告、compaction 断点、`/handoff` 子命令（list/show/restore）、延迟接力（临时打开 git、配真仓库验证反推链路）。假的 commands 服务按桌面版的真实校验逻辑写（`handler` 不是函数就 `throw`），默认的 `llm.stream` 直接抛错——模型调用失败时插件必须退回纯事实包。全程 `DSH_HOME` 指向临时目录，`DSH_HANDOFF_NO_GIT=1` 让 git 探测确定性关闭，不碰真实 `~/.dsh`。
+`mock-run.mjs` 用假 ctx 真的调用 `apply()`：工具/命令注册、`agent/created(startup)` 注入、`resume`/subagent 跳过、`recall_context` 分节（含 `packId` 和 `deadEnds`）、80% 自动落盘、`/handoff` 官方 `handler` 契约、命令脱敏、`handoff_list`、`toSession` 投递、结论自动补写（含关闭开关）、过期包警告、compaction 断点、`/handoff` 子命令（list/show/restore）、延迟接力（临时打开 git、配真仓库验证反推链路）、多次接力后的弧线 + 差异注入、`recall_context(query=...)` 全文检索。假的 commands 服务按桌面版的真实校验逻辑写（`handler` 不是函数就 `throw`），默认的 `llm.stream` 直接抛错——模型调用失败时插件必须退回纯事实包。全程 `DSH_HOME` 指向临时目录，`DSH_HANDOFF_NO_GIT=1` 让 git 探测确定性关闭，不碰真实 `~/.dsh`。
 
 想验证真实会话抽出来的东西，用回放：
 
@@ -107,7 +111,7 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 1. 聊几轮 → 让模型调 `handoff_save`，最好**传 `summary` / `nextStep` / `openQuestions` / `refs`**（不传也会补一次模型调用，但自己写的更准）；或 `/handoff <一句话结论>`
 2. 检查 `~/.dsh/handoff/<workspace-key>/latest.json`（`<workspace-key>` 是工作区真实路径的 sha1 前 12 位）
 3. 开新会话 → 首条消息发出去后，会话开头应出现交接摘要（日志里会打印 `restored pack ...`）
-4. 问模型"上次改了哪些文件" → 它应该调 `recall_context(section="files")`；问"上次试过什么没成" → `section="deadEnds"`；问"还有哪些历史交接" → `handoff_list`
+4. 问模型"上次改了哪些文件" → 它应该调 `recall_context(section="files")`；问"上次试过什么没成" → `section="deadEnds"`；问"还有哪些历史交接" → `handoff_list`；问某个具体线索（人名/报错/功能名）→ `recall_context(query="...")` 跨全部历史包搜
 5. 想把摘要投给另一个正在跑的会话：`handoff_save(..., toSession="<会话 id>")` 或 `/handoff --to <会话 id> <结论>`
 6. 自己在命令面板里翻/恢复：`/handoff list`、`/handoff show <包 id>`、`/handoff restore <包 id>`（把某份历史包注入当前会话）
 
@@ -150,6 +154,8 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 - **失败教训（deadEnds）是启发式。** 失败来源是 `tool/result` 的 `isError`（或 `error.reason`）；另外同一命令出现 ≥2 次会标成"第一次多半没成功"——重跑也可能是故意的（比如改完再跑），所以文案是提示不是定论。deadEnds 同样过脱敏。
 - **compaction 前自动落断点包**（`trigger: 'compaction'`），被压掉的细节之后还能 `recall_context` 找回；本会话已存过包时不覆盖（那多半带模型结论）。断点包刻意不补写结论——compaction 本身已经在跑模型请求，这里必须快。
 - **`/handoff` 子命令按首个词匹配**：`list` / `show <id>` / `restore <id>`。副作用：以这三个词开头的普通结论会被当成子命令（`/handoff list all the TODOs`）——遇到这种措辞改用 `handoff_save` 工具或换个开头。
+- **弧线/增量只看本机包链。** 远端镜像只存 latest，所以换机器后第一次接力没有弧线（增量退化为全量）；从第二份包起恢复正常。弧线取前 3 份、检索取前 20 份包，都是硬上限。
+- **全文检索是子串匹配，不是分词检索。** 每包每分节取第一条命中行、最多 20 条，够定位"在哪份包的哪一节提到过"；要全文细节再用 `packId` + `section` 精读。英文大小写不敏感，中文按原样子串匹配。
 - **`toSession` 只投递给运行中的会话**（`ctx.agents.get` 找得到的），inject 不唤醒 driver，目标会话要等下一条用户消息才 claim。会话列表在投递失败的返回值里。
 - **相对 `refs` 会先按 workspace、再按项目根解析。** 项目根从改动最多的文件推公共目录——用户常在家目录开会话去改 `D:` 上的仓库，光看 workspace 会解析错。
 - pack 存在 `~/.dsh/handoff/<workspace-key>/`（不写进用户项目），保留最近 20 份，可手动编辑。`<workspace-key>` 由工作区真实路径的 sha1 前 12 位算出，所以同一项目经软链接或盘符大小写变化仍指向同一目录。
@@ -165,14 +171,16 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 
 ## 下一步路线
 
-1. 压力提示接到 Web UI（状态栏圆环），可参考 `deepseek-harness-compaction-ui` 的落点
-2. pack 之间做"差异注入"：新会话和上一个会话在同一工作区且改动文件重叠时，L0 只带增量
-3. 多包合并：连续接力多个会话后，L0 带"几个会话以来的进展弧线"，而不是只有最新一份
-4. `recall_context(query=...)`：跨所有历史包全文检索
+1. ~~pack 之间做"差异注入"~~ ✓ v0.6.0
+2. ~~多包合并：L0 带"几个会话以来的进展弧线"~~ ✓ v0.6.0
+3. ~~`recall_context(query=...)` 全文检索~~ ✓ v0.6.0
+4. 压力提示接到 UI——**调研结论（v0.6.0）**：Web 生态的落点是 `@deepseek-ai/dsh-client-ui-slots` 的 `conversation.input.right` 槽位（`deepseek-harness-compaction-ui` 即此：esbuild 打一个 React 客户端 bundle，`package.json` 的 `dsh.client` 声明注入，后端经 `ctx.inject(['webServer'])` 注册 `/_plugins/<id>/settings` 路由给前端轮询）。**但当前桌面版（DSH NEXT asar 已核对）没有 `webServer` 服务、没有 `__ModuleLoader__`、也没有第三方客户端插件加载器**——槽位系统只被内置 UI 自用。等桌面版开放客户端插件加载后再做；届时后端沿同一模式加一条路由，数据直接复用现有的压力采样和 `handoff/pressure` / `handoff/restored` 事件。
+5. pack TTL 清理：`~/.dsh/handoff/` 目前只按数量截断（20 份），可加按年龄清理（与过期线联动）
+6. 弧线跨机器：远端镜像目前只存 latest，可改为存最近 N 份，让换机后也有弧线
 
 ## 生态里已有的两个同方向插件
 
 - `billion-context-dsh` — ACP 式压缩，替换 compaction 后端，压缩后仍可 `decompress` / `search_context`。它的 L2 检索思路可以直接复用。
-- `deepseek-harness-compaction-ui` — 给官方压缩做阈值配置卡片和进度圆环。
+- `deepseek-harness-compaction-ui` — 给官方压缩做阈值配置卡片和进度圆环。架构（v0.6.0 调研）：后端 `web-settings.js` 经 `ctx.inject(['webServer'])` 注册同源 HTTP 路由；前端是 esbuild 打包的 React IIFE（`package.json` 里 `dsh.client` 声明 peer 注入 + `dsh.bundle.patch` 改宿主插件配置），运行时经 `window.__ModuleLoader__.load` 加载，用 `ctx.slots.inject('conversation.input.right', ...)` 把圆环挂到输入框右侧、`'settings.plugin.item'` 挂设置卡。只适用于托管 Web 版。
 
 两者都做**会话内**，本插件做**会话间**，可共存。

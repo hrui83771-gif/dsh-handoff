@@ -20,6 +20,7 @@ import {
   listPacks,
   loadLatestPack,
   loadPackById,
+  loadRecentPacks,
   mirrorLatest,
   packAgeMs,
   readSection,
@@ -303,6 +304,31 @@ checks.push(
   ['listPacks 带年龄文案', typeof metas[1]?.age === 'string' && metas[1].age.includes('前')],
   ['loadPackById 命中', byId?.progress === '一小时前的旧结论。'],
   ['loadPackById 未命中返回 null', byMissing === null],
+)
+
+/* ---------------- 多包：弧线 + 差异注入 ---------------- */
+
+const recent = await loadRecentPacks(dir, 4)
+const withArc = toL0(withBrief, { previous: [olderPack] })
+checks.push(
+  ['loadRecentPacks 新的在前且排除 latest.json', recent.length === 2 && recent[0].id === withBrief.id && recent[1].id === olderPack.id],
+  ['loadRecentPacks 上限生效', (await loadRecentPacks(dir, 1)).length === 1],
+  ['L0 不传 previous 时没有弧线', !toL0(withBrief).includes('近几次交接的演化')],
+  ['L0 传 previous 带演化弧线', withArc.includes('近几次交接的演化') && withArc.includes('把 auth 从 JWT 换成 cookie')],
+  ['弧线带前一次的结论', withArc.includes('一小时前的旧结论')],
+  ['弧线带年龄', /- \d+ (分钟|小时|天)前「/.test(withArc)],
+  ['文件全重复时用注脚代替全量', withArc.includes('个文件在前几次交接里') && !withArc.includes('## 改动最多的文件\n- src/auth')],
+  ['已完成待办同样只带增量', withArc.includes('项在前几次交接里')],
+  ['弧线 L0 仍有预算上限', withArc.length <= 4000],
+)
+
+// 只有部分文件重复时：增量照常列出，注脚只统计被吞掉的
+const partialPrevious = { ...olderPack, files: ['src/auth/session.ts'], done: ['切到 cookie 签发'] }
+const withPartial = toL0(withBrief, { previous: [partialPrevious] })
+checks.push(
+  ['未重复的文件正常列出', withPartial.includes('- src/auth/index.ts')],
+  ['重复的文件不再列出', !withPartial.includes('## 改动最多的文件\n- src/auth/session.ts')],
+  ['注脚数字只算重复部分', withPartial.includes('另有 1 个文件') && withPartial.includes('另有 1 项')],
 )
 
 /* ---------------- 结论补写解析（parseBrief） ---------------- */

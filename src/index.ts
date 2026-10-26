@@ -37,11 +37,13 @@ import {
   listPacks,
   loadLatestPack,
   loadPackById,
+  loadRecentPacks,
   mirrorLatest,
   packAgeMs,
   readSection,
   savePack,
   toL0,
+  truncate,
   type HandoffPack,
   type PackMeta,
 } from './pack.js'
@@ -143,9 +145,14 @@ export function apply(ctx: Context) {
 
     const stale = isStale(pack)
 
+    // 前几次接力包：给 L0 提供演化弧线 + 差异注入（remote 镜像只存 latest，弧线只看本机链）
+    const recent = await loadRecentPacks(handoffRoot(ws), 4)
+    const at = recent.findIndex((p) => p.id === pack.id)
+    const previous = at >= 0 ? recent.slice(at + 1) : recent.filter((p) => p.id !== pack.id)
+
     const injected = injectContext(agent, {
       // 过时的包照样注入，但 L0 开头带显式警告：模型别照抄一周前的下一步
-      text: toL0(pack, { stale }),
+      text: toL0(pack, { stale, previous }),
       fromSession: pack.fromSession,
       packId: pack.id,
       form: 'recall',
@@ -410,18 +417,60 @@ export function apply(ctx: Context) {
 
   /* ---------------- 工具：按需取 L1 / L2 ---------------- */
 
+  /** 跨历史包全文检索：每个包的每个分节取第一条命中行，最多 20 条 */
+  const searchPacks = async (ws: WorkspaceRef, query: string, section?: string): Promise<string> => {
+    const q = query.toLowerCase()
+
+    const local = await loadRecentPacks(handoffRoot(ws), 20)
+    let packs = local
+    const facts = await gitFacts(ws.dir)
+    if (facts.remote) {
+      const remote = await loadRecentPacks(handoffRemoteRoot(facts.remote), 20)
+      const seen = new Set(local.map((p) => p.id))
+      packs = [...local, ...remote.filter((p) => !seen.has(p.id))]
+    }
+    if (!packs.length) return '(no handoff packs for this workspace)'
+
+    const hits: string[] = []
+    for (const pack of packs) {
+      for (const [name, text] of Object.entries(pack.sections ?? {})) {
+        if (section && name !== section) continue
+        const line = String(text ?? '')
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => l.toLowerCase().includes(q))
+        if (line) {
+          hits.push(`pack ${pack.id}（${formatAge(packAgeMs(pack))}）· ${name} · ${truncate(line, 200)}`)
+        }
+        if (hits.length >= 20) break
+      }
+      if (hits.length >= 20) break
+    }
+
+    return hits.length
+      ? hits.join('\n')
+      : `"${query}" 在 ${packs.length} 份交接包里没有命中${section ? `（分节 ${section}）` : ''}`
+  }
+
   ctx.tools.register(
     defineTool({
       name: 'recall_context',
       description:
-        'Read a section of a handoff pack carried over from a previous session. ' +
+        'Read a section of a handoff pack carried over from a previous session, ' +
+        'or full-text search across all recent packs with `query`. ' +
         'Use this instead of guessing what happened before. ' +
         'Defaults to the latest pack; pass packId (from handoff_list) for an older one.',
       parameters: {
         section: {
           type: 'string',
-          required: true,
-          description: `Which section to read: ${PACK_SECTIONS.join(' | ')}`,
+          description: `Which section to read: ${PACK_SECTIONS.join(' | ')}. Required unless query is given.`,
+        },
+        query: {
+          type: 'string',
+          description:
+            'Full-text search across all recent handoff packs (this workspace plus the ' +
+            'remote mirror): returns matching lines with pack id, age and section. ' +
+            'Combine with section to narrow down.',
         },
         packId: {
           type: 'string',
@@ -438,15 +487,25 @@ export function apply(ctx: Context) {
         if (!agent) return '(no active agent)'
 
         const ws = resolveWorkspace(agent)
+
+        const query = typeof args?.query === 'string' ? args.query.trim() : ''
+        if (query) {
+          const section = typeof args?.section === 'string' ? args.section.trim() : ''
+          return searchPacks(ws, query, section || undefined)
+        }
+
+        const section = typeof args?.section === 'string' ? args.section.trim() : ''
+        if (!section) return '(specify a section, or query="..." for full-text search)'
+
         const packId = typeof args?.packId === 'string' ? args.packId.trim() : ''
         const pack = await loadPackForWorkspace(ws, packId || undefined)
         if (!pack) return packId ? `(no pack ${packId} for this workspace)` : '(no handoff pack for this workspace)'
 
-        const body = readSection(pack, args.section)
-        if (body == null) return `(unknown section: ${args.section})`
+        const body = readSection(pack, section)
+        if (body == null) return `(unknown section: ${section})`
 
         return (
-          `# ${args.section}（来自会话 ${pack.fromSession}，${pack.createdAt}，pack ${pack.id}）\n\n` +
+          `# ${section}（来自会话 ${pack.fromSession}，${pack.createdAt}，pack ${pack.id}）\n\n` +
           (body || '(empty)')
         )
       },
