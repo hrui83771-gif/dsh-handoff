@@ -10,136 +10,34 @@ import { mkdtemp } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { buildPack } from '../dist/distill.js'
-import { PACK_VERSION, loadLatestPack, readSection, savePack, toL0 } from '../dist/pack.js'
+import { buildPack, redactCommand } from '../dist/distill.js'
+import { parseBrief } from '../dist/brief.js'
+import { normalizeRemote } from '../dist/git.js'
+import {
+  PACK_VERSION,
+  formatAge,
+  isStale,
+  listPacks,
+  loadLatestPack,
+  loadPackById,
+  mirrorLatest,
+  packAgeMs,
+  readSection,
+  savePack,
+  toL0,
+} from '../dist/pack.js'
+import { makeRichSession } from './fixtures/mock-ctx.mjs'
 
 /* ------------------------------------------------------------------ *
  * 假会话：投影（deriveMessages）和原始事件（snapshotEvents）都给全，
- * 用来覆盖"事件优先、投影兜底"两条路。
+ * 用来覆盖"事件优先、投影兜底"两条路。fixture 与 mock-run 共用。
  * ------------------------------------------------------------------ */
 
-const fakeSession = {
-  id: 'sess_demo_001',
-  cwd: process.cwd(),
-  deriveMessages: () => [
-    {
-      role: 'user',
-      source: { kind: 'user' },
-      content: [{ type: 'text', text: '把 auth 模块从 JWT 换成 session cookie，顺便补测试。' }],
-    },
-    {
-      // dsh 自己注入的上下文：role 是 user，但 kind 不是 'user'，必须忽略
-      role: 'user',
-      source: { kind: 'runtime-context' },
-      content: [{ type: 'text', text: '<runtime-context>cwd=/repo</runtime-context>' }],
-    },
-    {
-      role: 'assistant',
-      content: [
-        { type: 'text', text: '先看一下现有实现。' },
-        { type: 'tool-call', name: 'read_file', arguments: '{"path":"src/auth/jwt.ts"}' },
-      ],
-    },
-    {
-      role: 'assistant',
-      content: [
-        {
-          type: 'tool-call',
-          name: 'edit_file',
-          arguments: '{"file_path":"src/auth/session.ts","target":"src/auth/index.ts"}',
-        },
-        { type: 'tool-call', name: 'bash', arguments: '{"command":"pnpm test src/auth --run\\n# 省略"}' },
-        {
-          type: 'text',
-          text: [
-            '## 进度',
-            'JWT 签发路径已切到 cookie，index.ts 的导出还没改完。',
-            '',
-            '下一步：',
-            '- [ ] 更新 src/auth/index.ts 的导出',
-            '',
-            '未决问题：旧 token 是否需要兼容期？',
-          ].join('\n'),
-        },
-      ],
-    },
-    {
-      role: 'user',
-      source: { kind: 'user' },
-      content: [{ type: 'text', text: '把当前会话存成交接包。' }],
-    },
-  ],
-  snapshotEvents: () => [
-    { type: 'session', data: {} },
-    { type: 'session/title', data: { title: 'Auth 迁到 session cookie' } },
-    {
-      type: 'tool/call',
-      data: {
-        turn: 1,
-        name: 'edit',
-        arguments: '{"file_path":"src/auth/session.ts"}',
-      },
-    },
-    {
-      type: 'tool/call',
-      data: {
-        turn: 2,
-        name: 'multi_edit',
-        arguments: '{"paths":["src/auth/index.ts","src/auth/cookie.ts"]}',
-      },
-    },
-    {
-      type: 'tool/call',
-      data: {
-        turn: 2,
-        name: 'write',
-        arguments: '{"path":"src/auth/session.ts"}',
-      },
-    },
-    {
-      type: 'tool/call',
-      data: {
-        turn: 3,
-        name: 'pwsh',
-        arguments: '{"command":"pnpm test src/auth --run\\n# 长输出省略"}',
-      },
-    },
-    {
-      type: 'tool/call',
-      data: {
-        turn: 3,
-        name: 'pwsh',
-        arguments: '{"command":"cd repo; Get-ChildItem -Force"}',
-      },
-    },
-    {
-      type: 'todo/write',
-      data: {
-        todos: [
-          { content: '切到 cookie 签发', status: 'completed' },
-          { content: '更新 index.ts 导出', status: 'in_progress' },
-        ],
-      },
-    },
-    {
-      type: 'todo/write',
-      data: {
-        todos: [
-          { content: '切到 cookie 签发', status: 'completed' },
-          { content: '更新 index.ts 导出', status: 'completed' },
-          { content: '补 session 过期测试', status: 'pending' },
-        ],
-      },
-    },
-    { type: 'turn/end', data: { turn: 7 } },
-    {
-      type: 'tool/call',
-      data: { turn: 7, name: 'handoff_save', arguments: '{"summary":"x"}' },
-    },
-  ],
-}
+const fakeSession = makeRichSession()
 
 const dir = await mkdtemp(join(tmpdir(), 'dsh-handoff-smoke-'))
+// 冒烟也可能写出文件（mirrorLatest）：全程指向临时目录，不碰真实 ~/.dsh
+process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'dsh-handoff-home-'))
 
 const factsOnly = buildPack({
   session: fakeSession,
@@ -198,7 +96,7 @@ const checks = [
 /* ---------------- 注入路径（用假 agent，不需要 dsh） ---------------- */
 
 const { injectContext, makeInjectedMessage } = await import('../dist/compat.js')
-const { handoffRoot, resolveWorkspace } = await import('../dist/workspace.js')
+const { handoffRemoteRoot, handoffRoot, resolveWorkspace } = await import('../dist/workspace.js')
 
 const recallMsg = makeInjectedMessage({
   text: toL0(withBrief),
@@ -287,6 +185,113 @@ checks.push(
   ['适配器不声明时退回兜底值', fromFallback.tokens === DEFAULT_WINDOW_TOKENS && fromFallback.source === 'fallback'],
   ['环境变量优先级最高', fromEnv.tokens === 200_000 && fromEnv.source === 'env'],
   ['路由 key 用 provider/model', routeOf(agentWithRoute) === 'deepseek-official/deepseek-flash'],
+)
+
+/* ---------------- 命令脱敏（密钥不落盘） ---------------- */
+
+checks.push(
+  ['Bearer 凭证打码', !redactCommand('curl -H "Authorization: Bearer sk-live-abcdef123456" x').includes('sk-live-abcdef123456')],
+  ['key=value 赋值打码', redactCommand('DEEPSEEK_API_KEY=sk-1234567890 pnpm build').includes('DEEPSEEK_API_KEY=***')],
+  ["$env:TOKEN='...' 打码", redactCommand("$env:TOKEN='ghp_abcdefgh12345'; pnpm t").includes('TOKEN=***')],
+  ['URL 里的密码打码', redactCommand('git push https://user:pass12345@host/r.git').includes(':***@')],
+  ['--token= 形式打码', redactCommand('tool --token=abcdef123456 run').includes('--token=***')],
+  ['普通命令原样保留', redactCommand('pnpm test src/auth --run') === 'pnpm test src/auth --run'],
+  ['构建命令里的普通参数不误伤', !redactCommand('pnpm test --runInBand').includes('***')],
+)
+
+/* ---------------- 跨机器接力：远端 key ---------------- */
+
+checks.push(
+  ['scp 形式远端归一化', normalizeRemote('git@github.com:foo/bar.git') === 'github.com/foo/bar'],
+  ['https 远端归一化（去协议/斜杠/大小写）', normalizeRemote('https://GitHub.com/foo/bar/') === 'github.com/foo/bar'],
+  ['远端 key 目录带 remote- 前缀', handoffRemoteRoot('github.com/foo/bar').includes('remote-')],
+  ['同一远端 → 同一目录', handoffRemoteRoot('github.com/foo/bar') === handoffRemoteRoot('github.com/foo/bar')],
+)
+
+const remoteDir = handoffRemoteRoot('github.com/foo/bar')
+await mirrorLatest(remoteDir, withBrief)
+const mirrored = await loadLatestPack(remoteDir)
+checks.push(
+  ['mirrorLatest 镜像 latest.json', mirrored?.id === withBrief.id],
+  ['镜像目录能被 loadLatestPack 读回', (await loadLatestPack(remoteDir))?.goal === withBrief.goal],
+)
+
+/* ---------------- 包新鲜度 ---------------- */
+
+const oldPack = { ...withBrief, createdAt: new Date(Date.now() - 10 * 86_400_000).toISOString() }
+
+checks.push(
+  ['formatAge 天级', formatAge(packAgeMs(oldPack)) === '10 天前'],
+  ['formatAge 小时级', formatAge(2 * 3_600_000) === '2 小时前'],
+  ['formatAge 分钟级', formatAge(5 * 60_000) === '5 分钟前'],
+  ['formatAge 刚刚', formatAge(0) === '刚刚'],
+  ['超过 3 天默认过期线 → stale', isStale(oldPack) === true],
+  ['新鲜包不 stale', isStale(withBrief) === false],
+)
+
+process.env.DSH_HANDOFF_MAX_AGE_DAYS = '0'
+const staleOff = isStale(oldPack)
+process.env.DSH_HANDOFF_MAX_AGE_DAYS = '30'
+const staleWide = isStale(oldPack)
+delete process.env.DSH_HANDOFF_MAX_AGE_DAYS
+checks.push(
+  ['DSH_HANDOFF_MAX_AGE_DAYS=0 关掉过期判断', staleOff === false],
+  ['DSH_HANDOFF_MAX_AGE_DAYS=30 放宽过期线', staleWide === false],
+)
+
+checks.push(
+  ['过期包 L0 开头带警告', toL0(oldPack, { stale: true }).trimStart().startsWith('⚠') && toL0(oldPack, { stale: true }).includes('早已过期')],
+  ['新鲜包 L0 不带警告', !toL0(withBrief).includes('早已过期')],
+  ['L0 标注写入时间', toL0(withBrief).includes('写于 刚刚')],
+)
+
+/* ---------------- git 事实进 pack / L0 ---------------- */
+
+const withGit = buildPack({
+  session: fakeSession,
+  workspaceDir: dir,
+  window: 1_000_000,
+  pressure: { totalTokens: 812_000, window: 1_000_000, ratio: 0.812 },
+  git: { remote: 'github.com/foo/bar', branch: 'main', commit: 'abcdef1234567890' },
+})
+checks.push(
+  ['git 事实写进 pack', withGit.git?.remote === 'github.com/foo/bar' && withGit.git?.branch === 'main'],
+  ['没有 git 事实时不写字段', factsOnly.git === undefined],
+  ['L0 带上来源仓库', toL0(withGit).includes('github.com/foo/bar') && toL0(withGit).includes('main@abcdef12')],
+  ['无结论时 conclusionSource=activity', factsOnly.conclusionSource === 'activity'],
+  ['有 brief 时 conclusionSource=brief', withBrief.conclusionSource === 'brief'],
+)
+
+/* ---------------- 历史包：list / 按 id 读 ---------------- */
+
+const olderPack = {
+  ...withBrief,
+  id: 'older00001',
+  createdAt: new Date(Date.now() - 3600_000).toISOString(),
+  progress: '一小时前的旧结论。',
+  conclusionSource: 'brief',
+}
+await savePack(dir, olderPack)
+const metas = await listPacks(dir)
+const byId = await loadPackById(dir, 'older00001')
+const byMissing = await loadPackById(dir, 'nosuch0000')
+checks.push(
+  ['listPacks 新的在前', metas.length === 2 && metas[0].id === withBrief.id],
+  ['listPacks 标注结论有无', metas[0]?.hasConclusion === true],
+  ['listPacks 带年龄文案', typeof metas[1]?.age === 'string' && metas[1].age.includes('前')],
+  ['loadPackById 命中', byId?.progress === '一小时前的旧结论。'],
+  ['loadPackById 未命中返回 null', byMissing === null],
+)
+
+/* ---------------- 结论补写解析（parseBrief） ---------------- */
+
+checks.push(
+  ['parseBrief 正常 JSON', parseBrief('{"summary":"ok","nextStep":"n"}')?.summary === 'ok'],
+  ['parseBrief 容忍 markdown 围栏', parseBrief('前置 ```json\n{"summary":"ok"}\n``` 后缀')?.summary === 'ok'],
+  ['parseBrief 剔除超长字段', (parseBrief(`{"summary":"${'x'.repeat(5000)}"}`)?.summary ?? '').length <= 1200],
+  ['parseBrief 非 JSON 返回 null', parseBrief('不是 JSON') === null],
+  ['parseBrief 缺结论字段返回 null', parseBrief('{"foo":1}') === null],
+  ['parseBrief 空输入返回 null', parseBrief('') === null],
 )
 
 let failed = 0

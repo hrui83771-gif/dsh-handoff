@@ -15,9 +15,12 @@ import { join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
+import { synthesizeBrief, synthEnabled } from './brief.js'
 import { buildPack, type PackBrief } from './distill.js'
+import { gitFacts } from './git.js'
 import {
   formatPressure,
   pressureHint,
@@ -28,14 +31,26 @@ import {
 } from './meter.js'
 import {
   PACK_SECTIONS,
+  formatAge,
+  isStale,
+  listPacks,
   loadLatestPack,
+  loadPackById,
+  mirrorLatest,
+  packAgeMs,
   readSection,
   savePack,
   toL0,
   type HandoffPack,
 } from './pack.js'
 import { injectContext, onSessionEvent, registerCommand } from './compat.js'
-import { dshHome, handoffRoot, resolveWorkspace, type WorkspaceRef } from './workspace.js'
+import {
+  dshHome,
+  handoffRemoteRoot,
+  handoffRoot,
+  resolveWorkspace,
+  type WorkspaceRef,
+} from './workspace.js'
 
 export const name = 'dsh-handoff'
 export const inject = ['agents', 'llm', 'sessions', 'tokenMeter', 'tools']
@@ -114,12 +129,15 @@ export function apply(ctx: Context) {
    */
   async function restore(agent: Agent): Promise<void> {
     const ws = resolveWorkspace(agent)
-    const pack = await loadLatestPack(handoffRoot(ws))
+    const pack = await loadPackForWorkspace(ws)
     if (!pack) return
     if (pack.fromSession === String(agent.session.id)) return // 自己交给自己，跳过
 
+    const stale = isStale(pack)
+
     const injected = injectContext(agent, {
-      text: toL0(pack),
+      // 过时的包照样注入，但 L0 开头带显式警告：模型别照抄一周前的下一步
+      text: toL0(pack, { stale }),
       fromSession: pack.fromSession,
       packId: pack.id,
       form: 'recall',
@@ -131,6 +149,11 @@ export function apply(ctx: Context) {
       return
     }
 
+    if (stale) {
+      console.warn(
+        `[dsh-handoff] pack ${pack.id} 写于 ${formatAge(packAgeMs(pack))}（已过期线），注入时带了过时警告`,
+      )
+    }
     console.log(
       `[dsh-handoff] restored pack ${pack.id}（会话 ${pack.fromSession}）→ 会话 ${agent.session.id}`,
     )
@@ -142,6 +165,32 @@ export function apply(ctx: Context) {
       fromSession: pack.fromSession,
       at: new Date().toISOString(),
     })
+  }
+
+  /**
+   * 找这个工作区的接力包：本机 key 目录优先（最新鲜），没有再按仓库
+   * origin 找远端镜像目录——换机器/换 clone 时本地 key 必然对不上，
+   * 远端地址才认得出来。
+   */
+  async function loadPackForWorkspace(ws: WorkspaceRef, packId?: string): Promise<HandoffPack | null> {
+    const local = packId
+      ? await loadPackById(handoffRoot(ws), packId)
+      : await loadLatestPack(handoffRoot(ws))
+    if (local) return local
+
+    const facts = await gitFacts(ws.dir)
+    if (!facts.remote) return null
+
+    const remote = packId
+      ? await loadPackById(handoffRemoteRoot(facts.remote), packId)
+      : await loadLatestPack(handoffRemoteRoot(facts.remote))
+    if (remote) {
+      console.log(
+        `[dsh-handoff] 本机无记录，按远端 ${facts.remote} 找到接力包 ${remote.id}` +
+          (packId ? '' : `（写于 ${formatAge(packAgeMs(remote))}）`),
+      )
+    }
+    return remote
   }
 
   /* ---------------- ① 压力监测 ---------------- */
@@ -212,13 +261,19 @@ export function apply(ctx: Context) {
     defineTool({
       name: 'recall_context',
       description:
-        'Read a section of the handoff pack carried over from the previous session. ' +
-        'Use this instead of guessing what happened before.',
+        'Read a section of a handoff pack carried over from a previous session. ' +
+        'Use this instead of guessing what happened before. ' +
+        'Defaults to the latest pack; pass packId (from handoff_list) for an older one.',
       parameters: {
         section: {
           type: 'string',
           required: true,
           description: `Which section to read: ${PACK_SECTIONS.join(' | ')}`,
+        },
+        packId: {
+          type: 'string',
+          description:
+            'Which pack to read, from handoff_list. Omit for the latest pack.',
         },
       },
       output: {
@@ -230,16 +285,59 @@ export function apply(ctx: Context) {
         if (!agent) return '(no active agent)'
 
         const ws = resolveWorkspace(agent)
-        const pack = await loadLatestPack(handoffRoot(ws))
-        if (!pack) return '(no handoff pack for this workspace)'
+        const packId = typeof args?.packId === 'string' ? args.packId.trim() : ''
+        const pack = await loadPackForWorkspace(ws, packId || undefined)
+        if (!pack) return packId ? `(no pack ${packId} for this workspace)` : '(no handoff pack for this workspace)'
 
         const body = readSection(pack, args.section)
         if (body == null) return `(unknown section: ${args.section})`
 
         return (
-          `# ${args.section}（来自会话 ${pack.fromSession}，${pack.createdAt}）\n\n` +
+          `# ${args.section}（来自会话 ${pack.fromSession}，${pack.createdAt}，pack ${pack.id}）\n\n` +
           (body || '(empty)')
         )
+      },
+    }),
+  )
+
+  /* ---------------- 工具：列出历史接力包 ---------------- */
+
+  ctx.tools.register(
+    defineTool({
+      name: 'handoff_list',
+      description:
+        'List saved handoff packs for this workspace, newest first. ' +
+        'Use a pack id with recall_context(packId=...) to read an older pack ' +
+        '(for example when the latest one is a facts-only auto save).',
+      parameters: {},
+      output: {
+        schema: { type: 'string' },
+        render: (_args: any, value: any) => [{ type: 'text', text: String(value) }],
+      },
+      async execute() {
+        const agent = ctx.agents.currentInitiator()
+        if (!agent) return '(no active agent)'
+
+        const ws = resolveWorkspace(agent)
+        const local = await listPacks(handoffRoot(ws))
+
+        let remote: Awaited<ReturnType<typeof listPacks>> = []
+        const facts = await gitFacts(ws.dir)
+        if (facts.remote) remote = await listPacks(handoffRemoteRoot(facts.remote))
+
+        // 本机的在前（更新鲜），按 id 去重
+        const seen = new Set(local.map((p) => p.id))
+        const rows = [...local, ...remote.filter((p) => !seen.has(p.id))]
+        if (!rows.length) return '(no handoff packs for this workspace)'
+
+        return rows
+          .slice(0, 10)
+          .map((p) => {
+            const tag = p.hasConclusion ? '' : ' [纯事实]'
+            const repo = p.git?.remote ? `  ${p.git.remote}` : ''
+            return `${p.id}  ${p.createdAt}（${p.age}）${tag}${repo}\n  ${p.goal || '(无标题)'}\n  ${p.progress || '(无结论)'}`
+          })
+          .join('\n\n')
       },
     }),
   )
@@ -249,12 +347,13 @@ export function apply(ctx: Context) {
   const createPack = async (
     agent: Agent,
     brief?: PackBrief,
-  ): Promise<{ pack: HandoffPack; file: string }> => {
+    opts: { synthesize?: boolean } = {},
+  ): Promise<{ pack: HandoffPack; file: string; synthesized: boolean }> => {
     const ws: WorkspaceRef = resolveWorkspace(agent)
     const window = await ensureWindow(agent)
     const pressure = readPressure(ctx, agent.session, window)
 
-    const pack = buildPack({
+    const input = {
       session: agent.session,
       workspaceDir: ws.dir,
       window,
@@ -265,11 +364,66 @@ export function apply(ctx: Context) {
             ratio: pressure.ratio,
           }
         : { totalTokens: 0, window, ratio: 0 },
-      brief,
-    })
+    }
+
+    // 仓库身份：先按会话 cwd 找；用户常在家目录开会话改 D: 上的仓库，
+    // 这时 cwd 不是仓库，等 buildPack 推出 projectRoot 再补一次。
+    let git = await gitFacts(ws.dir)
+
+    let pack = buildPack({ ...input, brief, git })
+    if (!git.remote && pack.projectRoot) git = await gitFacts(pack.projectRoot)
+
+    /**
+     * 结论补写：模型没传 summary 时补一次结构化调用（一次、低温、30s 超时）。
+     * 失败就保持纯事实包——和没有这个功能时行为一致。
+     */
+    let synthesized = false
+    if (opts.synthesize && !brief?.summary && synthEnabled()) {
+      const filled = await synthesizeBrief(ctx, agent, {
+        goal: pack.goal,
+        files: pack.files,
+        commands: pack.commands,
+        done: pack.done,
+        recentPrompts: pack.recentPrompts,
+        pressurePercent: Math.round(pack.pressure.ratio * 100),
+      })
+      if (filled?.summary) {
+        pack = buildPack({ ...input, brief: { ...brief, ...filled }, git })
+        pack.conclusionSource = 'synth'
+        synthesized = true
+      }
+    }
 
     const file = await savePack(handoffRoot(ws), pack)
-    return { pack, file }
+
+    // 跨机器接力：往按仓库 origin 分的目录镜像一份，换 clone 也找得回来
+    if (pack.git?.remote) void mirrorLatest(handoffRemoteRoot(pack.git.remote), pack)
+
+    return { pack, file, synthesized }
+  }
+
+  /**
+   * 把 L0 摘要投递给一个正在运行的会话（handoff_save 的 toSession / /handoff --to）。
+   * inject() 不唤醒 driver：目标会话要等下一条用户消息才 claim。
+   */
+  const deliverToSession = (sessionId: string, pack: HandoffPack): string => {
+    const target = ctx.agents.get(sessionId as unknown as SessionId)
+    if (!target) {
+      const live = (ctx.agents.list?.() ?? []).map((a) => String(a.session.id)).slice(0, 20)
+      return `⚠ 没有正在运行的会话 ${sessionId}。当前活动会话：${live.join('、') || '(无)'}`
+    }
+    if (String(target.session.id) === String(pack.fromSession)) {
+      return `⚠ 会话 ${sessionId} 就是这份包的来源会话，无需投递。`
+    }
+    const injected = injectContext(target, {
+      text: toL0(pack),
+      fromSession: pack.fromSession,
+      packId: pack.id,
+      form: 'recall',
+    })
+    if (!injected) return `⚠ 会话 ${sessionId} 的 inject() 失败。`
+    console.log(`[dsh-handoff] pack ${pack.id} 已投递给运行中的会话 ${sessionId}`)
+    return `已把交接摘要投递给会话 ${sessionId}（该会话下一条消息时生效）。`
   }
 
   /**
@@ -284,9 +438,11 @@ export function apply(ctx: Context) {
       const existing = await loadLatestPack(handoffRoot(ws))
       if (existing?.fromSession === String(agent.session.id)) return
 
-      const { pack } = await createPack(agent)
+      // 80% 时模型多半还没写结论：补一次结构化调用，失败就退回纯事实包
+      const { pack, synthesized } = await createPack(agent, undefined, { synthesize: true })
       console.log(
-        `[dsh-handoff] 自动落盘 pack ${pack.id}（上下文 ${Math.round(pack.pressure.ratio * 100)}%，纯事实，无模型结论）`,
+        `[dsh-handoff] 自动落盘 pack ${pack.id}（上下文 ${Math.round(pack.pressure.ratio * 100)}%，` +
+          `${synthesized ? '结论由模型补写' : '纯事实，无模型结论'}）`,
       )
     } catch (error) {
       console.warn(`[dsh-handoff] 自动落盘失败：${(error as Error)?.message ?? error}`)
@@ -307,7 +463,8 @@ export function apply(ctx: Context) {
           type: 'string',
           description:
             'What this session accomplished and what the conclusions are. ' +
-            'This is the most valuable field — the next session reads it first.',
+            'This is the most valuable field — the next session reads it first. ' +
+            'If omitted, one model call tries to fill it in, but your own summary is better.',
         },
         goal: {
           type: 'string',
@@ -328,6 +485,13 @@ export function apply(ctx: Context) {
           description:
             'Files the next session should read for details (e.g. a hand-written ' +
             'HANDOFF.md). Relative paths resolve against the workspace.',
+        },
+        toSession: {
+          type: 'string',
+          description:
+            'Optional: also deliver the summary to this RUNNING session id ' +
+            '(see handoff_list output / session id in the UI). Delivery takes ' +
+            'effect on that session\'s next message.',
         },
         note: {
           type: 'string',
@@ -352,7 +516,9 @@ export function apply(ctx: Context) {
         const note = str(args?.note)
         if (note) brief.nextStep = `${brief.nextStep ?? ''}\n- ${note}`.trim()
 
-        const { pack, file } = await createPack(agent, brief)
+        // 没传 summary 时补一次模型调用；失败退回纯事实包
+        const { pack, file, synthesized } = await createPack(agent, brief, { synthesize: true })
+
         const lines = [
           `交接包已保存：${file}`,
           `会话：${pack.fromSession}`,
@@ -363,8 +529,14 @@ export function apply(ctx: Context) {
           pack.refs.length ? `详细交接：${pack.refs.join('、')}` : '',
           brief.summary
             ? '结论已写入。现在开新会话，它会自动带上摘要。'
-            : '⚠ 没有传 summary：本次只存了事实（文件/命令/待办），结论需要下次补。',
+            : synthesized
+              ? '结论已由模型自动补写（DSH_HANDOFF_SYNTH=0 可关）。你自己的 summary 会更准。'
+              : '⚠ 没有传 summary，自动补写也没成：本次只存了事实（文件/命令/待办），结论需要下次补。',
         ].filter(Boolean)
+
+        const toSession = str(args?.toSession)
+        if (toSession) lines.push(deliverToSession(toSession, pack))
+
         return lines.join('\n')
       },
     }),
@@ -373,32 +545,50 @@ export function apply(ctx: Context) {
   registerCommand(ctx, {
     name: 'handoff',
     description: '保存当前会话的交接包，供下一个会话自动接续',
-    async run(args: string) {
-      const agent = ctx.agents.currentInitiator()
-      if (!agent) return '当前没有活动会话。'
+    hint: '<一句话结论>',
+    // agent 由 CommandInvocation 带来（收到这条命令的那个会话），比
+    // currentInitiator() 更准——多会话并存时不会指错对象。
+    async run(args: string, agent: Agent) {
+      // /handoff [--to <会话id>] <一句话结论>
+      let text = args ?? ''
+      let toSession: string | undefined
+      const toMatch = /(?:^|\s)--to\s+(\S+)/.exec(text)
+      if (toMatch) {
+        toSession = toMatch[1]
+        text = text.replace(toMatch[0], ' ').trim()
+      }
 
-      // /handoff <一句话结论> 直接把参数当 summary，避免"只存事实"
-      const brief: PackBrief | undefined = args?.trim() ? { summary: args.trim() } : undefined
-      const { pack, file } = await createPack(agent, brief)
+      // 剩下的话直接当 summary，避免"只存事实"；没给就补一次模型调用
+      const brief: PackBrief | undefined = text.trim() ? { summary: text.trim() } : undefined
+      const { pack, file, synthesized } = await createPack(agent, brief, { synthesize: true })
       const window = windowFor(agent)
       const pressure = window ? readPressure(ctx, agent.session, window) : null
       const head = pressure
         ? `当前上下文 ${formatPressure(pressure)}。`
         : '当前上下文压力未知（tokenMeter 或窗口容量未就绪）。'
 
-      return [
+      const conclusion = brief?.summary
+        ? '已记录（你自己写的）'
+        : synthesized
+          ? '已记录（模型自动补写）'
+          : '未记录（/handoff <一句话结论> 可补）'
+
+      const lines = [
         `${head}交接包已写入：`,
         file,
         '',
         `- 目标：${pack.goal || '(空)'}`,
-        `- 结论：${pack.progress ? '已记录' : '未记录（/handoff <一句话结论> 可补）'}`,
+        `- 结论：${conclusion}`,
         `- 改动文件：${pack.files.length} 个`,
         `- 命令：${pack.commands.length} 条`,
         `- 已完成待办：${pack.done.length} 项`,
         `- 未决问题：${pack.openQuestions.length} 条`,
         '',
         '开一个新会话即可自动接续；需要细节时模型会调用 recall_context。',
-      ].join('\n')
+      ]
+
+      if (toSession) lines.push(deliverToSession(toSession, pack))
+      return lines.join('\n')
     },
   })
 

@@ -5,9 +5,10 @@ DeepSeek Harness 的**跨会话上下文接力**插件。
 dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的是**同一会话内**上下文膨胀——隐藏旧条目、保留尾部。它解决不了另一件事：**新会话永远从零开始**。这个插件补的就是那个缺口。
 
 ```
-① 监测   tokenMeter 每个 step 采一次 → 60% 提醒 / 80% 建议交接（并自动落一份纯事实包）
-② 蒸馏   事实从会话日志派生 + 结论由模型补写 → pack.json
+① 监测   tokenMeter 每个 step 采一次 → 60% 提醒 / 80% 建议交接（并自动落一份包）
+② 蒸馏   事实从会话日志派生 + 结论由模型补写 → pack.json（命令先脱敏再落盘）
 ③ 注入   新会话 startup 时自动注入 L0 摘要，细节由 recall_context 按需取
+         过期包（默认 3 天）注入时带显式警告；本机没有就按 git remote 找镜像
 ```
 
 ## 为什么"事实自动、结论手写"
@@ -20,7 +21,7 @@ dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的
 
 这些都免费、确定、不会编。但"这次到底做完了什么、下一步该怎么走"只有当时那个模型知道——`v0.2` 曾试图从 assistant 的散文里拼，结果拼出来的是"复述用户原话"。
 
-所以现在：文件/命令/待办/标题/规模一律自动派生，`summary` / `nextStep` / `openQuestions` / `refs` 由 `handoff_save` 传入。模型不传就退化成纯事实包，**绝不拿散文冒充结论**。
+所以现在：文件/命令/待办/标题/规模一律自动派生，`summary` / `nextStep` / `openQuestions` / `refs` 由 `handoff_save` 传入。模型不传时，`v0.4` 会补一次 `ctx.llm.stream()` 结构化调用（一次、低温、30s 超时，`DSH_HANDOFF_SYNTH=0` 可关）；补写失败才退化成纯事实包。补出来的结论会标 `conclusionSource: 'synth'`，和模型在会话里亲口写的（`'brief'`）区分开——**绝不拿散文冒充结论**。
 
 ## 为什么分层注入
 
@@ -36,16 +37,19 @@ dsh 自带的 compaction（`ctx.compaction` / `dsh-compaction-basic`）解决的
 
 ```
 src/
-├─ index.ts      # apply：挂 agent/created、session/event、工具、命令
+├─ index.ts      # apply：挂 agent/created、session/event、工具、命令、投递
 ├─ meter.ts      # ctx.tokenMeter 采样 + 阈值
-├─ distill.ts    # 事实派生（事件日志）+ 结论合并（brief）
-├─ pack.ts       # 数据结构、落盘、L0 渲染、分节读取
-├─ workspace.ts  # 工作区身份（realpath + hash，不用裸 cwd 字符串）
+├─ distill.ts    # 事实派生（事件日志）+ 结论合并（brief）+ 命令脱敏
+├─ pack.ts       # 数据结构、落盘/镜像、L0 渲染、分节读取、新鲜度
+├─ brief.ts      # 模型没写结论时的一次性结构化补写（ctx.llm.stream）
+├─ git.ts        # 仓库身份（remote/branch/commit），跨机器接力用
+├─ workspace.ts  # 工作区身份（realpath + hash）+ 远端 key 目录
 └─ compat.ts     # 唯一对接 dsh 类型/事件的文件，dsh 升级后先看这里
 dist/            # tsc 产物，dsh 实际加载的是这里
 scripts/
-├─ smoke.mjs          # 离线冒烟测试，直接测 dist（41 项断言）
-├─ mock-run.mjs       # 假 ctx 端到端：apply() → agent/created → 注入（24 项断言）
+├─ smoke.mjs          # 离线冒烟测试，直接测 dist（60 项断言）
+├─ mock-run.mjs       # 假 ctx 端到端：apply() → 注入/投递/补写（32 项断言）
+├─ fixtures/mock-ctx.mjs # 共享假环境：会话/agent/ctx，两个测试共用一套契约
 ├─ replay-distill.mjs # 拿真实会话日志回放蒸馏，可 --brief / --save
 ├─ verify-pack.mjs    # 只读校验落盘包 + 预览 L0
 ├─ session-log.mjs    # 多帧 zstd 解码 + 会话日志读取
@@ -58,14 +62,14 @@ scripts/
 **1. 先验证纯逻辑（不需要 dsh）**
 
 ```sh
-pnpm install      # 装 @deepseek-ai/dsh-tools@0.2.1-rc.2 和类型
+pnpm install      # 装 @deepseek-ai/dsh-tools@0.2.1-rc.3 和类型
 pnpm build        # tsc → dist/
-pnpm test         # 冒烟 41 项 + 端到端 24 项
+pnpm test         # 冒烟 60 项 + 端到端 32 项
 ```
 
-冒烟测试直接测 `dist/`——也就是 dsh 真正加载的那份 JS，41 项断言：事实派生（文件/命令/待办合并/标题）、结论合并、L0 预算裁剪、refs 解析、注入消息形状、工作区 key 稳定性、上下文窗口解析。
+冒烟测试直接测 `dist/`——也就是 dsh 真正加载的那份 JS：事实派生（文件/命令/待办合并/标题）、结论合并、L0 预算裁剪、refs 解析、注入消息形状、工作区 key 稳定性、上下文窗口解析，以及命令脱敏、远端 key、新鲜度、历史包列表、`parseBrief` 解析。
 
-`mock-run.mjs` 用假 ctx 真的调用 `apply()`：注册工具、触发 `agent/created(startup)`、检查注入内容、验证 `resume`/subagent 跳过、`recall_context` 分节、80% 只报一次 + 自动落纯事实包。全程 `DSH_HOME` 指向临时目录，不碰真实 `~/.dsh`。
+`mock-run.mjs` 用假 ctx 真的调用 `apply()`：工具/命令注册、`agent/created(startup)` 注入、`resume`/subagent 跳过、`recall_context` 分节（含 `packId`）、80% 自动落盘、`/handoff` 官方 `handler` 契约、命令脱敏、`handoff_list`、`toSession` 投递、结论自动补写（含关闭开关）、过期包警告。假的 commands 服务按桌面版的真实校验逻辑写（`handler` 不是函数就 `throw`），默认的 `llm.stream` 直接抛错——模型调用失败时插件必须退回纯事实包。全程 `DSH_HOME` 指向临时目录，`DSH_HANDOFF_NO_GIT=1` 让 git 探测确定性关闭，不碰真实 `~/.dsh`。
 
 想验证真实会话抽出来的东西，用回放：
 
@@ -93,18 +97,19 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 [dsh-handoff] window deepseek-official/deepseek-flash = 1,000,000 tok (adapter)
 ```
 
-插件自带 `@deepseek-ai/dsh-tools@0.2.1-rc.2`（与桌面版 0.2.1-rc.2 对齐），所以放在任何目录都能解析，不用挪进 dsh 仓库。
+插件自带 `@deepseek-ai/dsh-tools@0.2.1-rc.3`（lib 与桌面版内置的 `0.2.1-rc.2` 逐字节相同），所以放在任何目录都能解析，不用挪进 dsh 仓库。
 
 **3. 用一遍**
 
-1. 聊几轮 → 让模型调 `handoff_save`，**记得传 `summary` / `nextStep` / `openQuestions` / `refs`**（或 `/handoff <一句话结论>`）
+1. 聊几轮 → 让模型调 `handoff_save`，最好**传 `summary` / `nextStep` / `openQuestions` / `refs`**（不传也会补一次模型调用，但自己写的更准）；或 `/handoff <一句话结论>`
 2. 检查 `~/.dsh/handoff/<workspace-key>/latest.json`（`<workspace-key>` 是工作区真实路径的 sha1 前 12 位）
-3. 开新会话 → 首条消息发出去后，会话开头应出现交接摘要
-4. 问模型"上次改了哪些文件" → 它应该调 `recall_context(section="files")`
+3. 开新会话 → 首条消息发出去后，会话开头应出现交接摘要（日志里会打印 `restored pack ...`）
+4. 问模型"上次改了哪些文件" → 它应该调 `recall_context(section="files")`；问"还有哪些历史交接" → `handoff_list`
+5. 想把摘要投给另一个正在跑的会话：`handoff_save(..., toSession="<会话 id>")` 或 `/handoff --to <会话 id> <结论>`
 
 ## 与 dsh 类型的对接
 
-`src/compat.ts` 是唯一直接对接 dsh 类型的文件，内容全部按官方 `.d.ts` 写（dsh `0.2.1-rc.2`），不是猜的：
+`src/compat.ts` 是唯一直接对接 dsh 类型的文件，内容全部按官方 `.d.ts` 写（dsh `0.2.1-rc.3`；lib 与桌面版内置的 `0.2.1-rc.2` 逐字节相同，rc.3 只是内部依赖 pin 的 bump），不是猜的：
 
 | 对接点 | 来源 | 确认方式 |
 |---|---|---|
@@ -114,12 +119,15 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 | `agent/created` | `@deepseek-ai/dsh-agent` | 载荷 `{ agent, source: 'startup' \| 'resume' \| 'clear' \| 'compact' }` |
 | `tokenMeter.measure` | `@deepseek-ai/dsh-token-meter` | `measure(session): TokenMeasurement`，含 `totalTokens` |
 | `defineTool` / `ctx.tools.register` | `@deepseek-ai/dsh-tools` | 编译期校验 |
+| `ctx.llm.stream(GenerateOptions)` | `@deepseek-ai/dsh-llm` | `text-delta` 拼接，`RequestUserInput` 不带 id/source |
+| `ctx.agents.get / list` | `@deepseek-ai/dsh-agent` | `toSession` 投递按 SessionId 找运行中的会话 |
+| `CommandDefinition` / `CommandInvocation` | `@deepseek-ai/dsh-commands` | `register(definition)` 强制 `handler` 是函数，返回 `CommandResult`；已核对桌面 asar 内置实现 |
 
-只有 `registerCommand` 仍是形状探测：`@deepseek-ai/dsh-commands` 在 npm 上只发布到 `0.0.1-rc.1`，与 `0.2.1-rc.2` 对不上。两种调用形式都试，失败就静默降级——用 `handoff_save` 工具触发同样能生成交接包。
+`commands` 注册已不再是形状探测。`@deepseek-ai/dsh-commands` 现在发布到 `0.2.1-rc.3`（`next` 标签），契约是 `register(CommandDefinition)` 且强制 `definition.handler` 是函数——旧的 `{run, execute}` 形状会被 `TypeError` 拒掉，这正是 `/handoff` 之前一直没挂上的原因：两种探测形式都栽在缺 `handler`，失败又被静默吞了。现在按官方类型写 handler（`invocation.rawInput` → `CommandResult`），`dsh-commands` 只 `import type`，运行时用宿主自己的 commands 服务实例，不打进插件产物。`commands` 服务缺席的 profile（web/headless）仍静默降级到 `handoff_save` 工具。
 
 ## 版本对齐
 
-插件把 `@deepseek-ai/dsh-tools` 作为自己的依赖固定成 `0.2.1-rc.2`，和桌面版当前版本一致。dsh 升级后要同步改这个版本号再 `pnpm install`，否则 `defineTool` 产出的对象可能对不上新的 `ToolDefinition` 形状。
+插件把 `@deepseek-ai/dsh-tools` 作为自己的依赖固定成 `0.2.1-rc.3`（与桌面版内置的 `0.2.1-rc.2` 的 lib 逐字节相同）。dsh 升级后要同步改这个版本号再 `pnpm install`，否则 `defineTool` 产出的对象可能对不上新的 `ToolDefinition` 形状。注意这些包的 `latest` dist-tag 还停在老版本，新版本都在 `next` 标签上，`pnpm add @deepseek-ai/dsh-tools@next` 才装得到。
 
 ## 已知边界
 
@@ -127,17 +135,29 @@ node scripts/replay-distill.mjs "<会话目录>" --brief=brief.json --out=out.tx
 - **`resume` / `clear` / `compact` 不注入**，只对 `source === 'startup'` 生效，避免同一份摘要被反复塞进上下文。
 - **子会话不注入。** `header.origin === 'subagent'` 或 `delegationDepth > 0` 的会话会跳过，否则每个 subagent 都会白背一份父会话摘要。
 - **阈值必须早于 compaction。** 默认 60%/80%。窗口不是写死的：插件用 `ctx.llm.resolveModelInfo(provider, model)` 读适配器声明的 `contextWindow`，读不到才退回 1,000,000，并在日志里打印实际取到的值。想强制指定就设 `DSH_HANDOFF_WINDOW`。
-- **结论只能由模型补。** 事件日志能派生文件、命令、待办、标题、规模，但派生不出"为什么这么做"。`handoff_save` 不传 `summary` 时会在返回值里明确警告，L0 里也只会出现事实性活动统计。
-- **80% 会自动落一份纯事实包**，防止模型没来得及交接就断了。它不会覆盖本会话已经存过的包（那多半带模型结论）。
+- **结论优先用模型亲口写的。** `handoff_save` 传了 `summary` 就直接用；没传时补一次 `ctx.llm.stream()` 结构化调用（一次、低温、600 token、30s 超时），失败才退化成事实性活动统计。补写的结论标 `conclusionSource: 'synth'`，`handoff_list` 里能看出来源。`DSH_HANDOFF_SYNTH=0` 可整体关闭。
+- **命令落盘前脱敏。** 密钥形状（`Bearer xxx`、`sk-…`、`TOKEN=xxx`、URL 密码）在写进 pack 之前打码——pack 会持久化到 `~/.dsh/handoff/` 再注入新会话，这是唯一可能把密钥带出会话的路径。宁可错杀（`--token=x` 也被打码）不留真值。
+- **过期包注入时带警告。** 默认 3 天过期线（`DSH_HANDOFF_MAX_AGE_DAYS`，`0` 关掉判断）；过期包照样注入，但 L0 第一行是显式警告，让模型先确认现状再参考，不要照抄一周前的"下一步"。
+- **80% 会自动落一份包**，防止模型没来得及交接就断了。它不会覆盖本会话已经存过的包（那多半带模型结论）。llm 补写失败时这份是纯事实包。
+- **跨机器接力靠 git remote 镜像。** workspace-key 是本地路径 hash，换机器必然对不上；落盘时往 `~/.dsh/handoff/remote-<key>/` 镜像一份（key 按归一化 origin 算），本机找不到包时按当前仓库 origin 兜底查找。限制：要求会话 cwd 在仓库内——用户在家目录开会话改 `D:` 上的仓库时，远端探测拿不到，只有本机 key 目录这一条路。
+- **`toSession` 只投递给运行中的会话**（`ctx.agents.get` 找得到的），inject 不唤醒 driver，目标会话要等下一条用户消息才 claim。会话列表在投递失败的返回值里。
 - **相对 `refs` 会先按 workspace、再按项目根解析。** 项目根从改动最多的文件推公共目录——用户常在家目录开会话去改 `D:` 上的仓库，光看 workspace 会解析错。
 - pack 存在 `~/.dsh/handoff/<workspace-key>/`（不写进用户项目），保留最近 20 份，可手动编辑。`<workspace-key>` 由工作区真实路径的 sha1 前 12 位算出，所以同一项目经软链接或盘符大小写变化仍指向同一目录。
 
+## 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `DSH_HANDOFF_WINDOW` | 读适配器，读不到 1,000,000 | 强制上下文窗口（token） |
+| `DSH_HANDOFF_SYNTH` | 开 | 设 `0` 关闭"结论自动补写" |
+| `DSH_HANDOFF_MAX_AGE_DAYS` | 3 | 过期线（天）；`0` 关掉过期判断 |
+| `DSH_HANDOFF_NO_GIT` | 未设 | 测试用：设任意值跳过 git 探测 |
+
 ## 下一步路线
 
-1. `progress` / `nextStep` 增加可选的 `ctx.llm.stream()` 一次结构化摘要（模型没传 brief 时才用，其余字段不动）
-2. 压力提示接到 Web UI（状态栏圆环），可参考 `deepseek-harness-compaction-ui` 的落点
-3. 跨工作区接力：pack 里带 git remote + branch，换机器也能接
-4. `handoff_save` 支持 `--to <session>`，把摘要投递给正在运行的另一个会话
+1. 压力提示接到 Web UI（状态栏圆环），可参考 `deepseek-harness-compaction-ui` 的落点
+2. 远端镜像目前要求会话 cwd 在仓库内；可以按改动文件反推仓库根，覆盖"家目录开会话改别处仓库"的场景
+3. pack 之间做"差异注入"：新会话和上一个会话在同一工作区且改动文件重叠时，L0 只带增量
 
 ## 生态里已有的两个同方向插件
 

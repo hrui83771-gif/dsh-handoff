@@ -1,18 +1,24 @@
 /**
  * compat.ts —— 与 dsh 具体类型对接的唯一文件。
  *
- * 全部按官方 .d.ts 写（dsh 0.2.1-rc.2）：
+ * 全部按官方 .d.ts 写（dsh 0.2.1-rc.3；lib 与桌面版内置的 0.2.1-rc.2 逐字节相同，
+ * rc.3 只是内部依赖 pin 的 bump，所以类型同时覆盖桌面运行时）：
  *   UserMessage / MessageId / MessageSourceMap  → @deepseek-ai/dsh-llm
  *   Session / SessionEvent / session/event      → @deepseek-ai/dsh-session
  *   Agent / AgentRegistry / agent/created       → @deepseek-ai/dsh-agent
+ *   CommandDefinition / CommandInvocation       → @deepseek-ai/dsh-commands
  *
- * 唯一还剩形状探测的是 commands 注册（@deepseek-ai/dsh-commands 在 registry
- * 上只有 0.0.1-rc.1，与 0.2.1-rc.2 对不上），失败会静默降级到 handoff_save。
+ * commands 注册已不再是形状探测。桌面版（内置 0.2.1-rc.2）register() 会强制
+ * 要求 definition.handler 是函数，旧的 {run, execute} 形状会被 TypeError 拒掉，
+ * 之前两种探测形式都栽在这——/handoff 其实从来没挂上过，只是失败被静默吞了。
+ * 现在按官方 CommandDefinition 写；dsh-commands 只 import type，运行时用宿主
+ * 自己的 commands 服务实例，不打进插件产物。
  */
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
 import type { ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -116,42 +122,60 @@ export function findAgent(ctx: Context, session: Session): Agent | undefined {
 }
 
 /* ------------------------------------------------------------------ *
- * 人类命令注册（仍是形状探测）
+ * 人类命令注册（官方 CommandDefinition 契约）
  * ------------------------------------------------------------------ */
 
 export interface CommandSpec {
   name: string
   description: string
-  run: (args: string) => Promise<string>
+  /** composer 在用户还没打字时显示的输入提示 */
+  hint?: string
+  /** rawInput = 命令名之后的原文；agent = 收到这条命令的那个会话 */
+  run: (args: string, agent: Agent) => Promise<string>
 }
 
+/**
+ * 注册人类斜杠命令。
+ *
+ * 官方契约（桌面版内置的 0.2.1-rc.2 与 npm 上的 0.2.1-rc.3 lib 相同）：
+ *   register(definition: CommandDefinition): () => void
+ *   if (typeof definition.handler !== 'function') throw TypeError
+ * handler 收 CommandInvocation（取 rawInput / agent），返回 CommandResult。
+ * handler 抛错由注册表 settle 成 kind:'error'；这里也兜一层，给出可读文案。
+ */
 export function registerCommand(ctx: Context, spec: CommandSpec): boolean {
-  const definition = {
+  const definition: CommandDefinition = {
     name: spec.name,
     description: spec.description,
-    run: spec.run,
-    execute: spec.run,
+    ...(spec.hint ? { input: { hint: spec.hint } } : {}),
+    handler: async (invocation) => {
+      try {
+        const text = await spec.run(invocation.rawInput.trim(), invocation.agent)
+        return { kind: 'success', text }
+      } catch (error) {
+        return { kind: 'error', text: (error as Error)?.message ?? String(error) }
+      }
+    },
   }
 
   let registered = false
   try {
-    ctx.inject(['commands'], (c: any) => {
-      const commands = c?.commands
-      if (!commands?.register) return
-      try {
-        commands.register(definition)
-        registered = true
-      } catch {
-        try {
-          commands.register(spec.name, definition)
-          registered = true
-        } catch {
-          /* 签名不匹配：降级，用户改用 handoff_save 工具 */
-        }
-      }
+    // commands 是可选服务：web / headless profile 可能没装，缺席就静默降级
+    ctx.inject(['commands'], (c: Context) => {
+      if (typeof c.commands?.register !== 'function') return
+      c.commands.register(definition)
+      registered = true
+      // 注册结果必须可见：之前形状探测一直失败却没人发现，就是因为全静默
+      console.log(`[dsh-handoff] /${spec.name} 已注册（commands 服务就绪）`)
     })
   } catch {
-    /* commands 服务不存在 */
+    /* commands 服务不存在：用户改用 handoff_save 工具 */
+  }
+  if (!registered) {
+    console.warn(
+      `[dsh-handoff] /${spec.name} 未注册：commands 服务未就绪` +
+        `（该 profile 可能没有命令面板；生成交接包请改用 handoff_save 工具）`,
+    )
   }
   return registered
 }

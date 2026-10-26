@@ -23,6 +23,10 @@ import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 
+import type { Session } from '@deepseek-ai/dsh-session'
+
+import type { GitFacts } from './git.js'
+import { hasGitFacts } from './git.js'
 import type { HandoffPack, PackStats, PackTodo } from './pack.js'
 import { PACK_VERSION, buildSections, truncate } from './pack.js'
 
@@ -58,6 +62,33 @@ const BUILD_LIKE =
 /** 去掉开头的 `cd xxx;` / `$env:X=...;` 赋值，看真正的命令是什么 */
 const LEADING_NOISE = /^\s*((cd\s+[^;&|]+|\$env:\w+='[^']*'|set\s+\w+=[^;&|]*)\s*[;&|]+\s*)+/i
 
+/* ------------------------------------------------------------------ *
+ * 命令脱敏
+ *
+ * pack 会落盘到 ~/.dsh/handoff/ 再注入新会话——命令原文里混着的密钥会跟着
+ * 一起持久化。宁可错杀（`--token=x` 被打码）也不留真值。
+ * ------------------------------------------------------------------ */
+
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  // Authorization: Bearer xxx / Basic xxx
+  [/\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}/gi, '$1 ***'],
+  // sk-xxx / ghp_xxx / xoxb-xxx 等常见 token 形状
+  [/\b(sk|pk|rk|ghp|gho|ghs|github_pat|xox[baprs])[-_][A-Za-z0-9._-]{8,}/g, '$1-***'],
+  // key=value / "api_key": "xxx"：变量名里带 key/token/secret/password 的一律打码
+  [
+    /((?:[A-Za-z0-9_.-]*(?:api[-_]?key|secret|token|passw(?:or)?d|credential|authorization)[A-Za-z0-9_.-]*)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|`[^`]*`|[^\s;&|]+)/gi,
+    '$1***',
+  ],
+  // URL 里的密码：scheme://user:pass@host
+  [/([a-z][a-z0-9+.-]*:\/\/[^:@/\s]+):[^@/\s]+@/gi, '$1:***@'],
+]
+
+export function redactCommand(cmd: string): string {
+  let out = cmd
+  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement)
+  return out
+}
+
 /** 模型对本次会话的结论。全部可选：不传就是纯事实包。 */
 export interface PackBrief {
   /** 一句话说明这次会话在做什么（覆盖自动取的标题） */
@@ -73,11 +104,14 @@ export interface PackBrief {
 }
 
 export interface DistillInput {
-  session: any
+  /** 官方 Session 类型；内部派生仍按形状防御性读取（投影/事件可能缺席） */
+  session: Session
   workspaceDir: string
   window: number
   pressure: { totalTokens: number; window: number; ratio: number }
   brief?: PackBrief
+  /** 仓库身份（remote/branch/commit），跨机器接力用；没有就不写进 pack */
+  git?: GitFacts
 }
 
 export function buildPack(input: DistillInput): HandoffPack {
@@ -127,7 +161,7 @@ export function buildPack(input: DistillInput): HandoffPack {
 
       if (SHELL.test(name)) {
         const cmd = firstLine(args.command ?? args.cmd ?? args.script)
-        if (cmd) pushUnique(commands, truncate(cmd, 200))
+        if (cmd) pushUnique(commands, truncate(redactCommand(cmd), 200))
         continue
       }
       if (!MUTATING.test(name) || NOT_MUTATING.test(name)) continue
@@ -204,10 +238,12 @@ export function buildPack(input: DistillInput): HandoffPack {
     fromTitle: title || undefined,
     workspace: input.workspaceDir,
     projectRoot,
+    git: hasGitFacts(input.git) ? input.git : undefined,
     pressure: input.pressure,
     goal,
     focus,
     progress,
+    conclusionSource: brief.summary?.trim() ? 'brief' : 'activity',
     nextStep,
     files: files.slice(0, 200),
     commands: rankCommands(commands).slice(0, 40),
@@ -318,7 +354,7 @@ function collectFromMessage(
 
     if (SHELL.test(name)) {
       const cmd = firstLine(args.command ?? args.cmd ?? args.script)
-      if (cmd) pushUnique(commands, truncate(cmd, 200))
+      if (cmd) pushUnique(commands, truncate(redactCommand(cmd), 200))
       continue
     }
     if (MUTATING.test(name) && !NOT_MUTATING.test(name)) collectPaths(args, files)

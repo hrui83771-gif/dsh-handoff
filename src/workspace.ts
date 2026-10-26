@@ -58,3 +58,15 @@ export function dshHome(): string {
 export function handoffRoot(ws: WorkspaceRef): string {
   return join(dshHome(), 'handoff', ws.key)
 }
+
+/**
+ * 跨机器接力的镜像目录：~/.dsh/handoff/remote-<key>/
+ *
+ * workspace-key 是本地路径 hash，换台机器必然对不上；仓库远端地址才是
+ * 跨机器稳定的身份。落盘时往这里镜像一份 latest.json，恢复时本机 key
+ * 目录找不到就按当前仓库的 origin 找到这里（见 index.ts）。
+ */
+export function handoffRemoteRoot(remote: string): string {
+  const key = createHash('sha1').update(remote.trim().toLowerCase()).digest('hex').slice(0, 12)
+  return join(dshHome(), 'handoff', `remote-${key}`)
+}
